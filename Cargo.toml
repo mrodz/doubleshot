@@ -1,7 +1,13 @@
 [package]
 name = "doubleshot"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "A generic blue-green deployment helper that watches an inbox, verifies application health, and orchestrates traffic switching."
+readme = "README.md"
+repository = "https://github.com/mrodz/doubleshot" # Update this
+keywords = ["deployment", "blue-green", "nginx", "daemon", "devops"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [features]
 docker-tests = []

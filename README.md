@@ -1,5 +1,7 @@
 # doubleshot
 
+[![CI](https://github.com/mrodz/doubleshot/actions/workflows/ci.yml/badge.svg)](https://github.com/mrodz/doubleshot/actions)
+
 `doubleshot` is a generic blue-green deployment helper. It can run as a daemon
 that watches an inbox, or it can deploy a local artifact directly. The app
 runtime, health check, slots, and traffic switch are configured instead of being
@@ -51,7 +53,7 @@ port = 8082
 
 [launch]
 command = "/usr/bin/java -Dserver.port={port} -jar {artifact}"
-env_files = ["/opt/bankerbee/prod.env"]
+env_files = ["/opt/myappname/prod.env"]
 
 [health]
 kind = "http"

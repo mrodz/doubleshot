@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "doubleshot"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 dependencies = [
  "clap",
  "nginx-config",

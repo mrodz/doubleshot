@@ -10,6 +10,7 @@ hardcoded to one stack.
 ```bash
 doubleshot init-config
 doubleshot init-config --output doubleshot.toml
+doubleshot init-config --from-nginx --nginx-conf /etc/nginx/nginx.conf
 doubleshot serve --config /opt/doubleshot/doubleshot.toml
 doubleshot deploy build/libs/app.jar --config /opt/doubleshot/doubleshot.toml
 doubleshot status --config /opt/doubleshot/doubleshot.toml
@@ -18,6 +19,11 @@ doubleshot status --config /opt/doubleshot/doubleshot.toml
 `serve` watches the configured inbox directory and deploys artifacts as they
 arrive. `deploy <artifact>` imports and deploys one artifact immediately on the
 current machine.
+
+`init-config --from-nginx` scans existing Nginx config, ranks likely
+reverse-proxy locations, and prints a proposed `doubleshot.toml`. It does not
+modify Nginx. Use `--server-name api.example.com` to bias candidate selection
+when one Nginx host has multiple proxied apps.
 
 Common path flags can override config values:
 
@@ -139,3 +145,18 @@ or the other configured slot port.
 
 The rest of the server block can keep owning TLS, origin verification, rate
 limits, and proxy headers.
+
+## Tests
+
+Run the normal unit tests:
+
+```bash
+cargo test
+```
+
+Docker-backed integration tests use `testcontainers` and are feature-gated so
+normal test runs do not require Docker:
+
+```bash
+cargo test --features docker-tests
+```

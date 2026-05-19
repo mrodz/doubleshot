@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use nginx_config::ast::{Address, Directive, Item, LocationPattern, Main, ServerName};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -36,12 +37,41 @@ fn main() -> io::Result<()> {
             let config = AppConfig::load(cli.config.as_deref(), &overrides)?;
             print_status(&config)
         }
-        CommandKind::InitConfig { output } => {
-            let sample = toml::to_string_pretty(&FileConfig::sample())
-                .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+        CommandKind::InitConfig {
+            output,
+            from_nginx,
+            nginx_conf,
+            server_name,
+        } => {
+            let (sample, notes) = if from_nginx {
+                let proposal = scan_nginx_config(&nginx_conf, server_name.as_deref())?;
+                (
+                    toml::to_string_pretty(&proposal.config)
+                        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
+                    proposal.notes,
+                )
+            } else {
+                (
+                    toml::to_string_pretty(&FileConfig::sample())
+                        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
+                    Vec::new(),
+                )
+            };
+
             match output {
-                Some(path) => fs::write(path, sample),
+                Some(path) => {
+                    for note in notes {
+                        eprintln!("{note}");
+                    }
+                    fs::write(path, sample)
+                }
                 None => {
+                    for note in notes {
+                        println!("# {note}");
+                    }
+                    if from_nginx {
+                        println!();
+                    }
                     print!("{sample}");
                     Ok(())
                 }
@@ -76,6 +106,12 @@ enum CommandKind {
     InitConfig {
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        from_nginx: bool,
+        #[arg(long, default_value = "/etc/nginx/nginx.conf")]
+        nginx_conf: PathBuf,
+        #[arg(long)]
+        server_name: Option<String>,
     },
 }
 
@@ -355,6 +391,139 @@ struct EnvDefaults {
     shutdown_timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug)]
+struct NginxScanProposal {
+    config: FileConfig,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NginxScanFile {
+    path: PathBuf,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+struct NginxCandidate {
+    file: PathBuf,
+    server_names: Vec<String>,
+    listens: Vec<String>,
+    location: String,
+    proxy_pass: String,
+    target_host: String,
+    target_port: u16,
+    score: i32,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedProxyTarget {
+    host: String,
+    port: u16,
+}
+
+fn scan_nginx_config(root: &Path, server_name_hint: Option<&str>) -> io::Result<NginxScanProposal> {
+    let files = collect_nginx_files(root)?;
+    let upstreams = collect_upstreams(&files);
+    let mut candidates = Vec::new();
+
+    for file in &files {
+        let sanitized = sanitize_nginx_source(&file.source);
+        let parsed = nginx_config::parse_main(&sanitized).map_err(|err| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("failed to parse {}: {err}", file.path.display()),
+            )
+        })?;
+        collect_proxy_candidates(&parsed, &file.path, &upstreams, &mut candidates);
+    }
+
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!("no proxy_pass candidates found from {}", root.display()),
+        ));
+    }
+
+    for candidate in &mut candidates {
+        candidate.score = score_nginx_candidate(candidate, server_name_hint);
+    }
+    candidates.sort_by_key(|right| std::cmp::Reverse(right.score));
+
+    let selected = candidates[0].clone();
+    let config = FileConfig::from_nginx_candidate(&selected);
+    let mut notes = vec![format!(
+        "selected {} server_name={} location={} proxy_pass={}",
+        selected.file.display(),
+        if selected.server_names.is_empty() {
+            "<none>".to_string()
+        } else {
+            selected.server_names.join(",")
+        },
+        selected.location,
+        selected.proxy_pass
+    )];
+
+    notes.push("replace the selected proxy_pass with: include /etc/nginx/doubleshot/proxy-pass.inc;".to_string());
+    notes.push(format!(
+        "detected existing backend {}:{}; generated first deploy slot avoids that occupied port",
+        selected.target_host, selected.target_port
+    ));
+
+    if candidates.len() > 1 {
+        notes.push("ranked nginx candidates:".to_string());
+        for candidate in candidates.iter().take(5) {
+            notes.push(format!(
+                "score={} file={} server_name={} location={} proxy_pass={}",
+                candidate.score,
+                candidate.file.display(),
+                if candidate.server_names.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    candidate.server_names.join(",")
+                },
+                candidate.location,
+                candidate.proxy_pass
+            ));
+        }
+    }
+
+    Ok(NginxScanProposal { config, notes })
+}
+
+impl FileConfig {
+    fn from_nginx_candidate(candidate: &NginxCandidate) -> Self {
+        let first_port = next_available_port(candidate.target_port);
+        let second_port = next_available_port(first_port);
+        let mut slots = BTreeMap::new();
+        slots.insert(BLUE.to_string(), SlotFileConfig { port: first_port });
+        slots.insert(GREEN.to_string(), SlotFileConfig { port: second_port });
+
+        Self {
+            home: Some(PathBuf::from("/opt/doubleshot")),
+            inbox_dir: None,
+            releases_dir: None,
+            runtime_dir: None,
+            poll_seconds: Some(5),
+            shutdown_timeout_seconds: Some(20),
+            slots: Some(slots),
+            launch: Some(LaunchConfig {
+                command: "/usr/bin/java -Dserver.port={port} -jar {artifact}".to_string(),
+                env_files: Vec::new(),
+            }),
+            health: Some(HealthConfig::Tcp {
+                host: candidate.target_host.clone(),
+                timeout_seconds: 120,
+                interval_millis: 1000,
+            }),
+            switch: Some(SwitchConfig::NginxProxyPassInclude {
+                path: PathBuf::from("/etc/nginx/doubleshot/proxy-pass.inc"),
+                reload_command: "sudo nginx -t && sudo systemctl reload nginx".to_string(),
+                host: candidate.target_host.clone(),
+            }),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Slots {
     children: HashMap<String, Child>,
@@ -406,11 +575,10 @@ impl DeployLock {
 
 impl Drop for DeployLock {
     fn drop(&mut self) {
-        if let Err(err) = fs::remove_file(&self.path) {
-            if err.kind() != ErrorKind::NotFound {
+        if let Err(err) = fs::remove_file(&self.path)
+            && err.kind() != ErrorKind::NotFound {
                 eprintln!("failed to remove lock {}: {err}", self.path.display());
             }
-        }
     }
 }
 
@@ -443,6 +611,435 @@ fn serve(config: AppConfig) -> io::Result<()> {
     }
 }
 
+fn collect_nginx_files(root: &Path) -> io::Result<Vec<NginxScanFile>> {
+    let mut files = Vec::new();
+    let mut seen = BTreeMap::new();
+    collect_nginx_files_inner(root, &mut files, &mut seen)?;
+    Ok(files)
+}
+
+fn collect_nginx_files_inner(
+    path: &Path,
+    files: &mut Vec<NginxScanFile>,
+    seen: &mut BTreeMap<PathBuf, ()>,
+) -> io::Result<()> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if seen.insert(canonical, ()).is_some() {
+        return Ok(());
+    }
+
+    let source = fs::read_to_string(path)?;
+    files.push(NginxScanFile {
+        path: path.to_path_buf(),
+        source: source.clone(),
+    });
+
+    let base = path.parent().unwrap_or_else(|| Path::new("/"));
+    for include in scan_include_paths(&source, base)? {
+        collect_nginx_files_inner(&include, files, seen)?;
+    }
+
+    Ok(())
+}
+
+fn scan_include_paths(source: &str, base: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for line in source.lines() {
+        let uncommented = strip_comment(line);
+        let trimmed = uncommented.trim();
+        if !trimmed.starts_with("include ") {
+            continue;
+        }
+
+        let include = trimmed
+            .trim_start_matches("include")
+            .trim()
+            .trim_end_matches(';')
+            .trim_matches('"')
+            .trim_matches('\'');
+        let include_path = if Path::new(include).is_absolute() {
+            PathBuf::from(include)
+        } else {
+            base.join(include)
+        };
+
+        paths.extend(expand_simple_glob(&include_path)?);
+    }
+
+    Ok(paths)
+}
+
+fn expand_simple_glob(pattern: &Path) -> io::Result<Vec<PathBuf>> {
+    let pattern_string = pattern.display().to_string();
+    if !pattern_string.contains('*') {
+        return Ok(if pattern.exists() {
+            vec![pattern.to_path_buf()]
+        } else {
+            Vec::new()
+        });
+    }
+
+    let Some(parent) = pattern.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(name_pattern) = pattern.file_name().and_then(OsStr::to_str) else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if wildcard_match(name_pattern, name) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    Ok(paths)
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+
+    let mut remainder = value;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+
+        if index == 0 {
+            let Some(stripped) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = stripped;
+            continue;
+        }
+
+        let Some(position) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[position + part.len()..];
+    }
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn sanitize_nginx_source(source: &str) -> String {
+    let mut sanitized = String::new();
+    let mut skip_depth: i32 = 0;
+
+    for line in source.lines() {
+        let line_without_comment = strip_comment(line);
+        let trimmed = line_without_comment.trim();
+        if trimmed.is_empty() {
+            sanitized.push('\n');
+            continue;
+        }
+
+        if skip_depth > 0 {
+            skip_depth += count_char(trimmed, '{') as i32;
+            skip_depth -= count_char(trimmed, '}') as i32;
+            sanitized.push('\n');
+            continue;
+        }
+
+        let name = first_directive_name(trimmed);
+        if trimmed.contains('{') && !is_supported_nginx_block(name) {
+            skip_depth += count_char(trimmed, '{') as i32;
+            skip_depth -= count_char(trimmed, '}') as i32;
+            sanitized.push('\n');
+            continue;
+        }
+
+        if trimmed.ends_with(';') && !is_supported_nginx_directive(name) {
+            sanitized.push('\n');
+            continue;
+        }
+
+        sanitized.push_str(&line_without_comment);
+        sanitized.push('\n');
+    }
+
+    sanitized
+}
+
+fn strip_comment(line: &str) -> String {
+    line.split_once('#')
+        .map(|(before, _)| before.to_string())
+        .unwrap_or_else(|| line.to_string())
+}
+
+fn first_directive_name(line: &str) -> &str {
+    line.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('}')
+}
+
+fn is_supported_nginx_block(name: &str) -> bool {
+    matches!(name, "http" | "server" | "location" | "if" | "limit_except")
+}
+
+fn is_supported_nginx_directive(name: &str) -> bool {
+    matches!(
+        name,
+        "include"
+            | "listen"
+            | "server_name"
+            | "proxy_pass"
+            | "proxy_set_header"
+            | "proxy_http_version"
+            | "proxy_connect_timeout"
+            | "proxy_read_timeout"
+            | "proxy_send_timeout"
+            | "return"
+            | "rewrite"
+            | "set"
+            | "root"
+            | "alias"
+            | "error_page"
+            | "try_files"
+            | "ssl_certificate"
+            | "ssl_certificate_key"
+            | "index"
+    )
+}
+
+fn count_char(value: &str, needle: char) -> usize {
+    value
+        .chars()
+        .filter(|candidate| *candidate == needle)
+        .count()
+}
+
+fn collect_upstreams(files: &[NginxScanFile]) -> HashMap<String, ParsedProxyTarget> {
+    let mut upstreams = HashMap::new();
+    for file in files {
+        for (name, target) in scan_upstreams(&file.source) {
+            upstreams.insert(name, target);
+        }
+    }
+    upstreams
+}
+
+fn scan_upstreams(source: &str) -> Vec<(String, ParsedProxyTarget)> {
+    let mut upstreams = Vec::new();
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = strip_comment(lines[index]).trim().to_string();
+        if !trimmed.starts_with("upstream ") || !trimmed.contains('{') {
+            index += 1;
+            continue;
+        }
+
+        let name = trimmed
+            .trim_start_matches("upstream")
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('{')
+            .to_string();
+        let mut depth = count_char(&trimmed, '{') as i32 - count_char(&trimmed, '}') as i32;
+        index += 1;
+
+        while index < lines.len() && depth > 0 {
+            let line = strip_comment(lines[index]);
+            let inner = line.trim();
+            if inner.starts_with("server ") {
+                let server = inner
+                    .trim_start_matches("server")
+                    .trim()
+                    .trim_end_matches(';')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if let Some(target) = parse_host_port(server) {
+                    upstreams.push((name.clone(), target));
+                    break;
+                }
+            }
+            depth += count_char(inner, '{') as i32;
+            depth -= count_char(inner, '}') as i32;
+            index += 1;
+        }
+    }
+
+    upstreams
+}
+
+fn collect_proxy_candidates(
+    main: &Main,
+    file: &Path,
+    upstreams: &HashMap<String, ParsedProxyTarget>,
+    candidates: &mut Vec<NginxCandidate>,
+) {
+    collect_proxy_candidates_from_directives(&main.directives, file, upstreams, candidates);
+}
+
+fn collect_proxy_candidates_from_directives(
+    directives: &[Directive],
+    file: &Path,
+    upstreams: &HashMap<String, ParsedProxyTarget>,
+    candidates: &mut Vec<NginxCandidate>,
+) {
+    for directive in directives {
+        match &directive.item {
+            Item::Http(http) => collect_proxy_candidates_from_directives(
+                &http.directives,
+                file,
+                upstreams,
+                candidates,
+            ),
+            Item::Server(server) => collect_server_candidates(server, file, upstreams, candidates),
+            _ => {}
+        }
+    }
+}
+
+fn collect_server_candidates(
+    server: &nginx_config::ast::Server,
+    file: &Path,
+    upstreams: &HashMap<String, ParsedProxyTarget>,
+    candidates: &mut Vec<NginxCandidate>,
+) {
+    let server_names = server
+        .directives
+        .iter()
+        .flat_map(|directive| match &directive.item {
+            Item::ServerName(names) => names.iter().map(server_name_to_string).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let listens = server
+        .directives
+        .iter()
+        .filter_map(|directive| match &directive.item {
+            Item::Listen(listen) => Some(address_to_string(&listen.address)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for directive in &server.directives {
+        if let Item::Location(location) = &directive.item {
+            let location_name = location_pattern_to_string(&location.pattern);
+            for location_directive in &location.directives {
+                if let Item::ProxyPass(value) = &location_directive.item {
+                    let proxy_pass = value.to_string();
+                    if let Some(target) = parse_proxy_pass_target(&proxy_pass, upstreams) {
+                        candidates.push(NginxCandidate {
+                            file: file.to_path_buf(),
+                            server_names: server_names.clone(),
+                            listens: listens.clone(),
+                            location: location_name.clone(),
+                            proxy_pass,
+                            target_host: target.host,
+                            target_port: target.port,
+                            score: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_proxy_pass_target(
+    proxy_pass: &str,
+    upstreams: &HashMap<String, ParsedProxyTarget>,
+) -> Option<ParsedProxyTarget> {
+    let target = proxy_pass.strip_prefix("http://")?;
+    let authority = target.split('/').next().unwrap_or(target);
+    if let Some(parsed) = parse_host_port(authority) {
+        return Some(parsed);
+    }
+    upstreams.get(authority).cloned()
+}
+
+fn parse_host_port(authority: &str) -> Option<ParsedProxyTarget> {
+    let (host, port) = authority.rsplit_once(':')?;
+    Some(ParsedProxyTarget {
+        host: host.trim_matches(['[', ']']).to_string(),
+        port: port.parse().ok()?,
+    })
+}
+
+fn score_nginx_candidate(candidate: &NginxCandidate, server_name_hint: Option<&str>) -> i32 {
+    let mut score = 0;
+    if candidate.location == "/" {
+        score += 50;
+    }
+    if is_loopback_host(&candidate.target_host) {
+        score += 25;
+    }
+    if candidate
+        .listens
+        .iter()
+        .any(|listen| listen.contains("443"))
+    {
+        score += 10;
+    }
+    if let Some(hint) = server_name_hint
+        && candidate
+            .server_names
+            .iter()
+            .any(|server_name| server_name == hint)
+        {
+            score += 100;
+        }
+    score
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn next_available_port(port: u16) -> u16 {
+    match port {
+        0..=65533 => port + 1,
+        65534 => 65533,
+        65535 => 65534,
+    }
+}
+
+fn server_name_to_string(name: &ServerName) -> String {
+    match name {
+        ServerName::Exact(value) => value.clone(),
+        ServerName::Suffix(value) => format!(".{value}"),
+        ServerName::StarSuffix(value) => format!("*.{value}"),
+        ServerName::StarPrefix(value) => format!("{value}.*"),
+        ServerName::Regex(value) => format!("~{value}"),
+    }
+}
+
+fn address_to_string(address: &Address) -> String {
+    match address {
+        Address::Ip(address) => address.to_string(),
+        Address::StarPort(port) => format!("*:{port}"),
+        Address::Port(port) => port.to_string(),
+        Address::Unix(path) => format!("unix:{}", path.display()),
+    }
+}
+
+fn location_pattern_to_string(pattern: &LocationPattern) -> String {
+    match pattern {
+        LocationPattern::Prefix(value) => value.clone(),
+        LocationPattern::Exact(value) => format!("= {value}"),
+        LocationPattern::FinalPrefix(value) => format!("^~ {value}"),
+        LocationPattern::Regex(value) => format!("~ {value}"),
+        LocationPattern::RegexInsensitive(value) => format!("~* {value}"),
+        LocationPattern::Named(value) => format!("@{value}"),
+    }
+}
+
 fn deploy_artifact(
     config: &AppConfig,
     artifact: &Path,
@@ -471,7 +1068,7 @@ fn deploy_artifact(
     };
     let mut child = launch_slot(config, &context)?;
 
-    if let Err(err) = wait_until_ready(config, &context) {
+    if let Err(err) = wait_until_ready(config, &context, &mut child) {
         let _ = stop_child(&mut child, config.shutdown_timeout);
         let _ = quarantine_failed_artifact(config, &release);
         return Err(err);
@@ -482,11 +1079,10 @@ fn deploy_artifact(
     fs::write(config.active_release_file(), release.display().to_string())?;
     slots.put(&target.name, child);
 
-    if let Some(old_slot) = active_slot {
-        if old_slot != target.name {
+    if let Some(old_slot) = active_slot
+        && old_slot != target.name {
             stop_slot_if_running(config, slots, &old_slot)?;
         }
-    }
 
     println!(
         "deployment promoted {} on port {}",
@@ -600,7 +1196,11 @@ fn launch_slot(config: &AppConfig, context: &RenderContext<'_>) -> io::Result<Ch
     Ok(child)
 }
 
-fn wait_until_ready(config: &AppConfig, context: &RenderContext<'_>) -> io::Result<()> {
+fn wait_until_ready(
+    config: &AppConfig,
+    context: &RenderContext<'_>,
+    child: &mut Child,
+) -> io::Result<()> {
     match &config.health {
         HealthConfig::Tcp {
             host,
@@ -610,6 +1210,7 @@ fn wait_until_ready(config: &AppConfig, context: &RenderContext<'_>) -> io::Resu
             &format!("{}:{}", render_template(host, context), context.port),
             Duration::from_secs(*timeout_seconds),
             Duration::from_millis(*interval_millis),
+            child,
         ),
         HealthConfig::Http {
             url,
@@ -625,6 +1226,7 @@ fn wait_until_ready(config: &AppConfig, context: &RenderContext<'_>) -> io::Resu
             headers,
             Duration::from_secs(*timeout_seconds),
             Duration::from_millis(*interval_millis),
+            child,
         ),
     }
 }
@@ -653,13 +1255,19 @@ fn promote(config: &AppConfig, context: &RenderContext<'_>) -> io::Result<()> {
     }
 }
 
-fn wait_for_tcp(address: &str, timeout: Duration, interval: Duration) -> io::Result<()> {
+fn wait_for_tcp(
+    address: &str,
+    timeout: Duration,
+    interval: Duration,
+    child: &mut Child,
+) -> io::Result<()> {
     let address: SocketAddr = address
         .parse()
         .map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        ensure_child_running(child)?;
         match TcpStream::connect_timeout(&address, interval) {
             Ok(_) => return Ok(()),
             Err(_) => thread::sleep(interval),
@@ -679,10 +1287,12 @@ fn wait_for_http(
     headers: &HashMap<String, String>,
     timeout: Duration,
     interval: Duration,
+    child: &mut Child,
 ) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        ensure_child_running(child)?;
         match http_probe(url, method, headers, interval) {
             Ok(status) if status == expected_status => return Ok(()),
             Ok(_) | Err(_) => thread::sleep(interval),
@@ -693,6 +1303,16 @@ fn wait_for_http(
         ErrorKind::TimedOut,
         format!("HTTP health check did not return {expected_status} for {url}"),
     ))
+}
+
+fn ensure_child_running(child: &mut Child) -> io::Result<()> {
+    if let Some(status) = child.try_wait()? {
+        return Err(io::Error::other(
+            format!("application exited before becoming ready with status {status}"),
+        ));
+    }
+
+    Ok(())
 }
 
 fn http_probe(
@@ -1028,6 +1648,63 @@ mod tests {
         }
     }
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "doubleshot-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_fixture(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn scan_nginx_fixture(
+        name: &str,
+        files: &[(&str, &str)],
+        server_name_hint: Option<&str>,
+    ) -> NginxScanProposal {
+        let dir = temp_test_dir(name);
+        for (relative_path, contents) in files {
+            write_fixture(&dir.join(relative_path), contents);
+        }
+        scan_nginx_config(&dir.join("nginx.conf"), server_name_hint).unwrap()
+    }
+
+    fn assert_generated_config(
+        proposal: &NginxScanProposal,
+        blue_port: u16,
+        green_port: u16,
+        host: &str,
+    ) {
+        let slots = proposal.config.slots.as_ref().unwrap();
+        assert_eq!(slots.get(BLUE).unwrap().port, blue_port);
+        assert_eq!(slots.get(GREEN).unwrap().port, green_port);
+
+        let launch = proposal.config.launch.as_ref().unwrap();
+        assert_eq!(
+            launch.command,
+            "/usr/bin/java -Dserver.port={port} -jar {artifact}"
+        );
+
+        match proposal.config.health.as_ref().unwrap() {
+            HealthConfig::Tcp { host: actual, .. } => assert_eq!(actual, host),
+            other => panic!("expected tcp health config, got {other:?}"),
+        }
+
+        match proposal.config.switch.as_ref().unwrap() {
+            SwitchConfig::NginxProxyPassInclude { host: actual, .. } => assert_eq!(actual, host),
+        }
+    }
+
     #[test]
     fn renders_command_templates() {
         let artifact = Path::new("/tmp/my app.jar");
@@ -1091,5 +1768,388 @@ mod tests {
         assert_eq!(target_slot(&config, None).unwrap().name, BLUE);
         assert_eq!(target_slot(&config, Some(BLUE)).unwrap().name, GREEN);
         assert_eq!(target_slot(&config, Some(GREEN)).unwrap().name, BLUE);
+    }
+
+    #[test]
+    fn scans_nginx_direct_proxy_and_avoids_active_port() {
+        let dir = temp_test_dir("direct-proxy");
+        let root = dir.join("nginx.conf");
+        write_fixture(
+            &root,
+            r#"
+http {
+    server {
+        listen 443 ssl;
+        server_name api.example.com;
+        location / {
+            limit_req zone=api_limit burst=30 nodelay;
+            proxy_pass http://127.0.0.1:8080;
+        }
+    }
+}
+"#,
+        );
+
+        let proposal = scan_nginx_config(&root, None).unwrap();
+        let slots = proposal.config.slots.unwrap();
+
+        assert_eq!(slots.get(BLUE).unwrap().port, 8081);
+        assert_eq!(slots.get(GREEN).unwrap().port, 8082);
+        assert!(proposal.notes[0].contains("api.example.com"));
+    }
+
+    #[test]
+    fn scans_nginx_includes_and_named_upstream() {
+        let dir = temp_test_dir("named-upstream");
+        let root = dir.join("nginx.conf");
+        let app = dir.join("conf.d/app.conf");
+        write_fixture(
+            &root,
+            r#"
+http {
+    include conf.d/*.conf;
+}
+"#,
+        );
+        write_fixture(
+            &app,
+            r#"
+upstream app_backend {
+    server 127.0.0.1:9000;
+}
+
+server {
+    server_name app.example.com;
+    location / {
+        proxy_pass http://app_backend;
+    }
+}
+"#,
+        );
+
+        let proposal = scan_nginx_config(&root, Some("app.example.com")).unwrap();
+        let slots = proposal.config.slots.unwrap();
+
+        assert_eq!(slots.get(BLUE).unwrap().port, 9001);
+        assert_eq!(slots.get(GREEN).unwrap().port, 9002);
+        assert!(proposal.notes[0].contains("app_backend"));
+    }
+
+    #[test]
+    fn ranks_server_name_hint_first() {
+        let dir = temp_test_dir("ranking");
+        let root = dir.join("nginx.conf");
+        write_fixture(
+            &root,
+            r#"
+http {
+    server {
+        server_name first.example.com;
+        location / {
+            proxy_pass http://127.0.0.1:8080;
+        }
+    }
+    server {
+        server_name wanted.example.com;
+        location /api {
+            proxy_pass http://127.0.0.1:7000;
+        }
+    }
+}
+"#,
+        );
+
+        let proposal = scan_nginx_config(&root, Some("wanted.example.com")).unwrap();
+        let slots = proposal.config.slots.unwrap();
+
+        assert_eq!(slots.get(BLUE).unwrap().port, 7001);
+        assert!(proposal.notes[0].contains("wanted.example.com"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_for_plain_http_server() {
+        let proposal = scan_nginx_fixture(
+            "plain-http",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        listen 80;
+        server_name app.example.com;
+        location / {
+            proxy_pass http://127.0.0.1:3000;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 3001, 3002, "127.0.0.1");
+        assert!(proposal.notes[0].contains("app.example.com"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_when_proxy_pass_has_uri_path() {
+        let proposal = scan_nginx_fixture(
+            "proxy-pass-path",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        server_name app.example.com;
+        location /api/ {
+            proxy_pass http://127.0.0.1:4100/internal/;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 4101, 4102, "127.0.0.1");
+        assert!(proposal.notes[0].contains("proxy_pass=http://127.0.0.1:4100/internal/"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_for_localhost_backend() {
+        let proposal = scan_nginx_fixture(
+            "localhost-backend",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        server_name local.example.com;
+        location / {
+            proxy_pass http://localhost:5000;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 5001, 5002, "localhost");
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_for_private_network_backend() {
+        let proposal = scan_nginx_fixture(
+            "private-network-backend",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        server_name internal.example.com;
+        location / {
+            proxy_pass http://10.20.30.40:7000;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 7001, 7002, "10.20.30.40");
+    }
+
+    #[test]
+    fn nginx_scan_prefers_https_listener_when_no_hint_is_given() {
+        let proposal = scan_nginx_fixture(
+            "https-listener-rank",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        listen 80;
+        server_name web.example.com;
+        location / {
+            proxy_pass http://127.0.0.1:8100;
+        }
+    }
+    server {
+        listen 443 ssl;
+        server_name secure.example.com;
+        location / {
+            proxy_pass http://127.0.0.1:8200;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 8201, 8202, "127.0.0.1");
+        assert!(proposal.notes[0].contains("secure.example.com"));
+    }
+
+    #[test]
+    fn nginx_scan_prefers_root_location_over_nested_location() {
+        let proposal = scan_nginx_fixture(
+            "root-location-rank",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        server_name app.example.com;
+        location /api {
+            proxy_pass http://127.0.0.1:9100;
+        }
+        location / {
+            proxy_pass http://127.0.0.1:9200;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 9201, 9202, "127.0.0.1");
+        assert!(proposal.notes[0].contains("location=/ "));
+    }
+
+    #[test]
+    fn nginx_scan_uses_server_name_hint_over_default_ranking() {
+        let proposal = scan_nginx_fixture(
+            "server-name-hint-over-rank",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    server {
+        listen 443 ssl;
+        server_name default.example.com;
+        location / {
+            proxy_pass http://127.0.0.1:9300;
+        }
+    }
+    server {
+        listen 80;
+        server_name hinted.example.com;
+        location /api {
+            proxy_pass http://127.0.0.1:9400;
+        }
+    }
+}
+"#,
+            )],
+            Some("hinted.example.com"),
+        );
+
+        assert_generated_config(&proposal, 9401, 9402, "127.0.0.1");
+        assert!(proposal.notes[0].contains("hinted.example.com"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_from_quoted_include() {
+        let proposal = scan_nginx_fixture(
+            "quoted-include",
+            &[
+                (
+                    "nginx.conf",
+                    r#"
+http {
+    include "conf.d/app.conf";
+}
+"#,
+                ),
+                (
+                    "conf.d/app.conf",
+                    r#"
+server {
+    server_name include.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:9500;
+    }
+}
+"#,
+                ),
+            ],
+            None,
+        );
+
+        assert_generated_config(&proposal, 9501, 9502, "127.0.0.1");
+        assert!(proposal.notes[0].contains("conf.d/app.conf"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_from_upstream_with_path_suffix() {
+        let proposal = scan_nginx_fixture(
+            "upstream-path-suffix",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    upstream java_app {
+        server 127.0.0.1:9600;
+    }
+
+    server {
+        server_name upstream.example.com;
+        location / {
+            proxy_pass http://java_app/service/;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 9601, 9602, "127.0.0.1");
+        assert!(proposal.notes[0].contains("proxy_pass=http://java_app/service/"));
+    }
+
+    #[test]
+    fn nginx_scan_generates_config_when_unknown_directives_are_present() {
+        let proposal = scan_nginx_fixture(
+            "unknown-directives",
+            &[(
+                "nginx.conf",
+                r#"
+http {
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name noisy.example.com;
+        gzip on;
+
+        location / {
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_pass http://127.0.0.1:9700;
+        }
+    }
+}
+"#,
+            )],
+            None,
+        );
+
+        assert_generated_config(&proposal, 9701, 9702, "127.0.0.1");
+        assert!(proposal.notes[0].contains("noisy.example.com"));
+    }
+
+    #[test]
+    fn matches_simple_wildcards() {
+        assert!(wildcard_match("*.conf", "app.conf"));
+        assert!(wildcard_match("api-*.conf", "api-prod.conf"));
+        assert!(!wildcard_match("api-*.conf", "web-prod.conf"));
     }
 }

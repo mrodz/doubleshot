@@ -15,6 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BLUE: &str = "blue";
 const GREEN: &str = "green";
 const DEFAULT_CONFIG: &str = "doubleshot.toml";
+const RESET: &str = "\x1b[0m";
+const BLUE_FG: &str = "\x1b[34m";
+const GREEN_FG: &str = "\x1b[32m";
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
@@ -463,7 +466,10 @@ fn scan_nginx_config(root: &Path, server_name_hint: Option<&str>) -> io::Result<
         selected.proxy_pass
     )];
 
-    notes.push("replace the selected proxy_pass with: include /etc/nginx/doubleshot/proxy-pass.inc;".to_string());
+    notes.push(
+        "replace the selected proxy_pass with: include /etc/nginx/doubleshot/proxy-pass.inc;"
+            .to_string(),
+    );
     notes.push(format!(
         "detected existing backend {}:{}; generated first deploy slot avoids that occupied port",
         selected.target_host, selected.target_port
@@ -576,9 +582,10 @@ impl DeployLock {
 impl Drop for DeployLock {
     fn drop(&mut self) {
         if let Err(err) = fs::remove_file(&self.path)
-            && err.kind() != ErrorKind::NotFound {
-                eprintln!("failed to remove lock {}: {err}", self.path.display());
-            }
+            && err.kind() != ErrorKind::NotFound
+        {
+            eprintln!("failed to remove lock {}: {err}", self.path.display());
+        }
     }
 }
 
@@ -992,9 +999,9 @@ fn score_nginx_candidate(candidate: &NginxCandidate, server_name_hint: Option<&s
             .server_names
             .iter()
             .any(|server_name| server_name == hint)
-        {
-            score += 100;
-        }
+    {
+        score += 100;
+    }
     score
 }
 
@@ -1052,10 +1059,11 @@ fn deploy_artifact(
     let active_slot = active_slot(config)?;
     let target = target_slot(config, active_slot.as_deref())?;
 
+    println!("deploying {}", release.display());
     println!(
-        "deploying {} to {} on port {}",
-        release.display(),
-        target.name,
+        "traffic: {} -> {} on port {}",
+        active_slot_label(active_slot.as_deref()),
+        slot_label(&target.name),
         target.port
     );
 
@@ -1080,13 +1088,15 @@ fn deploy_artifact(
     slots.put(&target.name, child);
 
     if let Some(old_slot) = active_slot
-        && old_slot != target.name {
-            stop_slot_if_running(config, slots, &old_slot)?;
-        }
+        && old_slot != target.name
+    {
+        stop_slot_if_running(config, slots, &old_slot)?;
+    }
 
     println!(
-        "deployment promoted {} on port {}",
-        target.name, target.port
+        "traffic switched: {} active on port {}",
+        slot_label(&target.name),
+        target.port
     );
     Ok(())
 }
@@ -1307,9 +1317,9 @@ fn wait_for_http(
 
 fn ensure_child_running(child: &mut Child) -> io::Result<()> {
     if let Some(status) = child.try_wait()? {
-        return Err(io::Error::other(
-            format!("application exited before becoming ready with status {status}"),
-        ));
+        return Err(io::Error::other(format!(
+            "application exited before becoming ready with status {status}"
+        )));
     }
 
     Ok(())
@@ -1578,6 +1588,18 @@ fn render_template(template: &str, context: &RenderContext<'_>) -> String {
         .replace("{slot}", context.slot)
 }
 
+fn active_slot_label(slot: Option<&str>) -> String {
+    slot.map(slot_label).unwrap_or_else(|| "none".to_string())
+}
+
+fn slot_label(slot: &str) -> String {
+    match slot {
+        BLUE => format!("{BLUE_FG}⏹{RESET} {BLUE}"),
+        GREEN => format!("{GREEN_FG}⏹{RESET} {GREEN}"),
+        other => format!("⏹ {other}"),
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1717,6 +1739,12 @@ mod tests {
             rendered,
             "java -jar '/tmp/my app.jar' --port 8081 --slot blue"
         );
+    }
+
+    #[test]
+    fn renders_colored_slot_labels() {
+        assert_eq!(slot_label(BLUE), "\x1b[34m⏹\x1b[0m blue");
+        assert_eq!(slot_label(GREEN), "\x1b[32m⏹\x1b[0m green");
     }
 
     #[test]

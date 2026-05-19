@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -39,6 +39,14 @@ fn main() -> io::Result<()> {
         CommandKind::Status(overrides) => {
             let config = AppConfig::load(cli.config.as_deref(), &overrides)?;
             print_status(&config)
+        }
+        CommandKind::Follow {
+            artifact,
+            timeout_seconds,
+            overrides,
+        } => {
+            let config = AppConfig::load(cli.config.as_deref(), &overrides)?;
+            follow_deployment(&config, &artifact, timeout_seconds.map(Duration::from_secs))
         }
         CommandKind::InitConfig {
             output,
@@ -105,6 +113,14 @@ enum CommandKind {
     },
     /// Print current deployment state.
     Status(CommonOverrides),
+    /// Stream deployment events for an artifact queued in the inbox.
+    Follow {
+        artifact: String,
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+        #[command(flatten)]
+        overrides: CommonOverrides,
+    },
     /// Print or write a starter TOML config.
     InitConfig {
         #[arg(short, long)]
@@ -368,6 +384,10 @@ impl AppConfig {
 
     fn active_release_file(&self) -> PathBuf {
         self.runtime_dir.join("active-release")
+    }
+
+    fn deployment_events_file(&self) -> PathBuf {
+        self.runtime_dir.join("deployments.log")
     }
 
     fn pid_file(&self, slot: &str) -> PathBuf {
@@ -1080,10 +1100,42 @@ fn deploy_artifact(
     slots: &mut Slots,
 ) -> io::Result<()> {
     let _lock = DeployLock::acquire(config.lock_file())?;
+    let deploy_name = artifact_event_name(artifact);
 
-    let release = import_release(config, artifact, mode)?;
-    let active_slot = active_slot(config)?;
-    let target = target_slot(config, active_slot.as_deref())?;
+    record_deploy_event(
+        config,
+        &deploy_name,
+        "started",
+        &format!("picked up {}", artifact.display()),
+    );
+
+    let release = match import_release(config, artifact, mode) {
+        Ok(release) => release,
+        Err(err) => {
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
+    };
+    record_deploy_event(
+        config,
+        &deploy_name,
+        "imported",
+        &format!("imported release {}", release.display()),
+    );
+    let active_slot = match active_slot(config) {
+        Ok(active_slot) => active_slot,
+        Err(err) => {
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
+    };
+    let target = match target_slot(config, active_slot.as_deref()) {
+        Ok(target) => target,
+        Err(err) => {
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
+    };
 
     println!("deploying {}", release.display());
     println!(
@@ -1093,26 +1145,59 @@ fn deploy_artifact(
         target.port
     );
 
-    stop_slot_if_running(config, slots, &target.name)?;
+    if let Err(err) = stop_slot_if_running(config, slots, &target.name) {
+        record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+        return Err(err);
+    }
     let context = RenderContext {
         artifact: &release,
         port: target.port,
         slot: &target.name,
         release: &release,
     };
-    let mut child = launch_slot(config, &context)?;
+    record_deploy_event(
+        config,
+        &deploy_name,
+        "launching",
+        &format!("launching {} on port {}", target.name, target.port),
+    );
+    let mut child = match launch_slot(config, &context) {
+        Ok(child) => child,
+        Err(err) => {
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
+    };
 
+    record_deploy_event(
+        config,
+        &deploy_name,
+        "waiting",
+        "waiting for health check to pass",
+    );
     if let Err(err) = wait_until_ready(config, &context, &mut child) {
         let _ = stop_launched_slot(config, &mut child, &target.name);
         let _ = quarantine_failed_artifact(config, &release);
+        record_deploy_event(config, &deploy_name, "failed", &err.to_string());
         return Err(err);
     }
 
-    let previous_switch = capture_switch_state(config)?;
+    record_deploy_event(config, &deploy_name, "ready", "health check passed");
+    let previous_switch = match capture_switch_state(config) {
+        Ok(previous_switch) => previous_switch,
+        Err(err) => {
+            let _ = stop_launched_slot(config, &mut child, &target.name);
+            let _ = quarantine_failed_artifact(config, &release);
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
+    };
+    record_deploy_event(config, &deploy_name, "switching", "switching traffic");
     if let Err(err) = promote(config, &context) {
         let _ = restore_switch_state(config, previous_switch);
         let _ = stop_launched_slot(config, &mut child, &target.name);
         let _ = quarantine_failed_artifact(config, &release);
+        record_deploy_event(config, &deploy_name, "failed", &err.to_string());
         return Err(err);
     }
 
@@ -1120,6 +1205,7 @@ fn deploy_artifact(
         let _ = restore_switch_state(config, previous_switch);
         let _ = stop_launched_slot(config, &mut child, &target.name);
         let _ = quarantine_failed_artifact(config, &release);
+        record_deploy_event(config, &deploy_name, "failed", &err.to_string());
         return Err(err);
     }
 
@@ -1128,13 +1214,22 @@ fn deploy_artifact(
     if let Some(old_slot) = active_slot
         && old_slot != target.name
     {
-        stop_slot_if_running(config, slots, &old_slot)?;
+        if let Err(err) = stop_slot_if_running(config, slots, &old_slot) {
+            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+            return Err(err);
+        }
     }
 
     println!(
         "traffic switched: {} active on port {}",
         slot_label(&target.name),
         target.port
+    );
+    record_deploy_event(
+        config,
+        &deploy_name,
+        "succeeded",
+        &format!("{} active on port {}", target.name, target.port),
     );
     Ok(())
 }
@@ -1580,6 +1675,202 @@ fn print_status(config: &AppConfig) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DeploymentEvent {
+    timestamp: u64,
+    artifact: String,
+    phase: String,
+    message: String,
+}
+
+fn record_deploy_event(config: &AppConfig, artifact: &str, phase: &str, message: &str) {
+    if let Err(err) = append_deploy_event(config, artifact, phase, message) {
+        eprintln!("failed to record deployment event: {err}");
+    }
+}
+
+fn append_deploy_event(
+    config: &AppConfig,
+    artifact: &str,
+    phase: &str,
+    message: &str,
+) -> io::Result<()> {
+    fs::create_dir_all(&config.runtime_dir)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config.deployment_events_file())?;
+
+    writeln!(
+        file,
+        "{}\t{}\t{}\t{}",
+        unix_timestamp()?,
+        escape_event_field(artifact),
+        escape_event_field(phase),
+        escape_event_field(message)
+    )
+}
+
+fn follow_deployment(
+    config: &AppConfig,
+    artifact: &str,
+    timeout: Option<Duration>,
+) -> io::Result<()> {
+    config.ensure_dirs()?;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut offset = 0;
+    let mut saw_event = false;
+
+    println!("following deployment events for {artifact}");
+
+    loop {
+        let (next_offset, events) = read_deployment_events_since(config, offset)?;
+        offset = next_offset;
+
+        for event in events
+            .into_iter()
+            .filter(|event| event.artifact == artifact)
+        {
+            saw_event = true;
+            println!("[{}] {}", event.phase, event.message);
+
+            if is_terminal_phase(&event.phase) {
+                return if event.phase == "succeeded" {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(event.message))
+                };
+            }
+        }
+
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let detail = if saw_event {
+                format!("deployment did not finish within timeout for {artifact}")
+            } else {
+                format!("no deployment events arrived within timeout for {artifact}")
+            };
+            return Err(io::Error::new(ErrorKind::TimedOut, detail));
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn read_deployment_events_since(
+    config: &AppConfig,
+    offset: u64,
+) -> io::Result<(u64, Vec<DeploymentEvent>)> {
+    let path = config.deployment_events_file();
+    let mut file = match OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(err) => return Err(err),
+    };
+
+    let len = file.metadata()?.len();
+    let offset = offset.min(len);
+    file.seek(SeekFrom::Start(offset))?;
+
+    let mut reader = BufReader::new(file);
+    let mut events = Vec::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        if let Some(event) = parse_deployment_event(line.trim_end())? {
+            events.push(event);
+        }
+    }
+
+    Ok((reader.stream_position()?, events))
+}
+
+fn parse_deployment_event(line: &str) -> io::Result<Option<DeploymentEvent>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut parts = line.splitn(4, '\t');
+    let Some(timestamp) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(artifact) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(phase) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(message) = parts.next() else {
+        return Ok(None);
+    };
+
+    Ok(Some(DeploymentEvent {
+        timestamp: timestamp
+            .parse()
+            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
+        artifact: unescape_event_field(artifact),
+        phase: unescape_event_field(phase),
+        message: unescape_event_field(message),
+    }))
+}
+
+fn artifact_event_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("artifact")
+        .to_string()
+}
+
+fn is_terminal_phase(phase: &str) -> bool {
+    matches!(phase, "succeeded" | "failed")
+}
+
+fn escape_event_field(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn unescape_event_field(value: &str) -> String {
+    let mut unescaped = String::new();
+    let mut chars = value.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            unescaped.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('\\') => unescaped.push('\\'),
+            Some('t') => unescaped.push('\t'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some(other) => {
+                unescaped.push('\\');
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+
+    unescaped
+}
+
 fn load_file_config(config_path: Option<&Path>) -> io::Result<FileConfig> {
     let path = config_path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG));
     match fs::read_to_string(path) {
@@ -1901,6 +2192,43 @@ mod tests {
                 path: "/actuator/health".to_string()
             }
         );
+    }
+
+    #[test]
+    fn deployment_events_round_trip_escaped_fields() {
+        let line = format!(
+            "123\t{}\t{}\t{}",
+            escape_event_field("app\tone.jar"),
+            escape_event_field("waiting"),
+            escape_event_field("line one\nline two\\done")
+        );
+
+        assert_eq!(
+            parse_deployment_event(&line).unwrap().unwrap(),
+            DeploymentEvent {
+                timestamp: 123,
+                artifact: "app\tone.jar".to_string(),
+                phase: "waiting".to_string(),
+                message: "line one\nline two\\done".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn reads_deployment_events_since_offset() {
+        let dir = temp_test_dir("deployment-events");
+        let config = test_config(&dir, 8081, 8082);
+        config.ensure_dirs().unwrap();
+
+        append_deploy_event(&config, "app-a.jar", "started", "first").unwrap();
+        let offset = fs::metadata(config.deployment_events_file()).unwrap().len();
+        append_deploy_event(&config, "app-b.jar", "succeeded", "second").unwrap();
+
+        let (_, events) = read_deployment_events_since(&config, offset).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].artifact, "app-b.jar");
+        assert_eq!(events[0].phase, "succeeded");
+        assert_eq!(events[0].message, "second");
     }
 
     #[test]

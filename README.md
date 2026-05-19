@@ -27,6 +27,53 @@ tar -xzf doubleshot-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 sudo mv doubleshot /usr/local/bin/
 ```
 
+Linux release archives also include installer scripts for systemd hosts. To
+install the binary, create the runtime directories, write a Spring Boot-oriented
+config, install the systemd unit, and start the daemon:
+
+```bash
+tar -xzf doubleshot-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+./install.sh --version vX.Y.Z
+```
+
+The installer prompts with defaults and can be driven non-interactively:
+
+```bash
+DOUBLESHOT_HOME=/opt/doubleshot \
+DOUBLESHOT_USER=doubleshot \
+APP_TYPE=spring-boot \
+APP_ENV_FILE=/opt/myapp/prod.env \
+JAVA_BIN=/usr/bin/java \
+./install.sh --version vX.Y.Z
+```
+
+Supported `APP_TYPE` values are `spring-boot`, `django`, `axum`, and
+`express`. The app type sets the default `launch.command` and health path:
+
+| App type | Default launch command | Default health path |
+|---|---|---|
+| `spring-boot` | `env APP_VERSION={slot} /usr/bin/java -Dserver.port={port} -jar {artifact}` | `/actuator/health` |
+| `django` | `env PORT={port} APP_VERSION={slot} /usr/bin/python3 {artifact}` | `/health` |
+| `axum` | `env PORT={port} APP_VERSION={slot} {artifact}` | `/health` |
+| `express` | `env PORT={port} VERSION={slot} /usr/bin/node {artifact}` | `/health` |
+
+Set `LAUNCH_COMMAND` or `HEALTH_PATH` to override those defaults.
+
+Updates preserve `doubleshot.toml` and the existing service unit:
+
+```bash
+./update.sh --version vX.Y.Z
+```
+
+Uninstall removes the service, sudoers rule, and binary while preserving
+deployment state and config by default:
+
+```bash
+./uninstall.sh
+# remove /opt/doubleshot and the nginx include directory too
+./uninstall.sh --purge
+```
+
 **Build from source** (requires Rust 1.85+):
 
 ```bash
@@ -46,11 +93,15 @@ doubleshot init-config --from-nginx --nginx-conf /etc/nginx/nginx.conf
 doubleshot serve --config /opt/doubleshot/doubleshot.toml
 doubleshot deploy build/libs/app.jar --config /opt/doubleshot/doubleshot.toml
 doubleshot status --config /opt/doubleshot/doubleshot.toml
+doubleshot follow app-20260519T143000.jar --config /opt/doubleshot/doubleshot.toml
 ```
 
 `serve` watches the configured inbox directory and deploys artifacts as they
 arrive. `deploy <artifact>` imports and deploys one artifact immediately on the
-current machine.
+current machine. `follow <artifact-name>` streams deployment events written by
+`serve` until that artifact succeeds or fails. Queue artifacts with unique names
+when using `follow`, so the deployer follows the current deployment rather than
+an older `app.jar` event.
 
 `init-config --from-nginx` scans existing Nginx config, ranks likely
 reverse-proxy locations, and prints a proposed `doubleshot.toml`. It does not
@@ -119,7 +170,7 @@ By default, `home = "/opt/doubleshot"` creates:
 /opt/doubleshot/
   inbox/       # serve watches here
   releases/    # imported artifacts
-  runtime/     # deploy.lock, active-slot, active-release, pid files, logs
+  runtime/     # deploy.lock, active-slot, active-release, pid files, logs, deployments.log
 ```
 
 The deployment semaphore is `runtime/deploy.lock`. It is created atomically so

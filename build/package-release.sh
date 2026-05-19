@@ -41,17 +41,25 @@ for target in "${TARGETS[@]}"; do
   fi
 
   archive_name="${BINARY}-v${VERSION}-${target}"
+  package_dir="$TARGET_DIR/package/$archive_name"
+  rm -rf "$package_dir"
+  mkdir -p "$package_dir"
+  cp "$bin" "$package_dir/$BINARY"
+  cp "$REPO_DIR/scripts/install.sh" "$package_dir/install.sh"
+  cp "$REPO_DIR/scripts/update.sh" "$package_dir/update.sh"
+  cp "$REPO_DIR/scripts/uninstall.sh" "$package_dir/uninstall.sh"
+  chmod 0755 "$package_dir/$BINARY" "$package_dir/install.sh" "$package_dir/update.sh" "$package_dir/uninstall.sh"
 
   case "$target" in
     *apple-darwin*)
       archive="$OUT_DIR/${archive_name}.tar.gz"
-      tar -czf "$archive" -C "$TARGET_DIR/$target/release" "$BINARY"
+      tar -czf "$archive" -C "$package_dir" "$BINARY" "install.sh" "update.sh" "uninstall.sh"
       shasum -a 256 "$archive" | awk '{print $1}' > "${archive}.sha256"
       echo "  OK    $target  →  $(basename "$archive")"
       ;;
     *linux*)
       archive="$OUT_DIR/${archive_name}.tar.gz"
-      tar -czf "$archive" -C "$TARGET_DIR/$target/release" "$BINARY"
+      tar -czf "$archive" -C "$package_dir" "$BINARY" "install.sh" "update.sh" "uninstall.sh"
       shasum -a 256 "$archive" | awk '{print $1}' > "${archive}.sha256"
       echo "  OK    $target  →  $(basename "$archive")"
       ;;

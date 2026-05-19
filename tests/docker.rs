@@ -1,7 +1,9 @@
 #![cfg(feature = "docker-tests")]
 
 use std::{
+    collections::hash_map::DefaultHasher,
     fs,
+    hash::{Hash, Hasher},
     io::{self, IsTerminal, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -16,12 +18,19 @@ use std::{
 };
 
 use testcontainers::{
-    GenericImage, ImageExt,
-    core::{Host, IntoContainerPort, Mount, WaitFor},
-    runners::SyncRunner,
+    Container, GenericBuildableImage, GenericImage, ImageExt,
+    core::{BuildImageOptions, CmdWaitFor, ExecCommand, Host, IntoContainerPort, Mount, WaitFor},
+    runners::{SyncBuilder, SyncRunner},
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_doubleshot");
+const SSH_USER: &str = "deployer";
+const SSH_PASSWORD: &str = "doubleshot";
+const SSH_HOST: &str = "host.testcontainers.internal";
+const REMOTE_HOME: &str = "/opt/doubleshot";
+const REMOTE_CONFIG: &str = "/opt/doubleshot/doubleshot.toml";
+const SSH_BLUE_PORT: u16 = 18081;
+const SSH_GREEN_PORT: u16 = 18082;
 
 #[derive(Clone, Debug)]
 enum DockerAvailability {
@@ -207,6 +216,298 @@ fn assert_success(output: &std::process::Output) {
     );
 }
 
+#[derive(Debug)]
+struct ContainerCommandOutput {
+    code: i64,
+    stdout: String,
+    stderr: String,
+}
+
+impl ContainerCommandOutput {
+    fn success(&self) -> bool {
+        self.code == 0
+    }
+}
+
+struct SshTestRig {
+    _server: Container<GenericImage>,
+    deployer: Container<GenericImage>,
+    ssh_port: u16,
+}
+
+impl SshTestRig {
+    fn start(expected_status: u16) -> Self {
+        let server_image = build_ssh_server_image();
+        let deployer_image = build_ssh_deployer_image();
+
+        let server = server_image
+            .with_exposed_port(22.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening"))
+            .start()
+            .unwrap();
+        let ssh_port = server.get_host_port_ipv4(22.tcp()).unwrap();
+
+        let deployer = deployer_image
+            .with_wait_for(WaitFor::seconds(1))
+            .with_host(SSH_HOST, Host::HostGateway)
+            .start()
+            .unwrap();
+
+        let rig = Self {
+            _server: server,
+            deployer,
+            ssh_port,
+        };
+        rig.write_remote_config(expected_status);
+        rig.start_remote_serve();
+        rig
+    }
+
+    fn ssh(&self, remote_command: &str) -> ContainerCommandOutput {
+        self.exec_deployer(&format!(
+            "{} {}",
+            self.ssh_prefix(),
+            shell_quote_str(remote_command)
+        ))
+    }
+
+    fn exec_deployer(&self, script: &str) -> ContainerCommandOutput {
+        exec_container_shell(&self.deployer, script)
+    }
+
+    fn upload_artifact(&self, artifact: &str, contents: &str) {
+        let output = self.exec_deployer(&format!(
+            "printf %s {} > /work/{artifact} && {} /work/{artifact} {}@{}:{REMOTE_HOME}/inbox/{artifact}",
+            shell_quote_str(contents),
+            self.scp_prefix(),
+            SSH_USER,
+            SSH_HOST,
+        ));
+        assert!(
+            output.success(),
+            "scp failed\nstdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    fn start_follow(&self, label: &str, artifact: &str, timeout_seconds: u64) {
+        let remote = format!(
+            "doubleshot --config {REMOTE_CONFIG} follow {artifact} --timeout-seconds {timeout_seconds}",
+        );
+        let script = format!(
+            "rm -f /work/{label}.out /work/{label}.err /work/{label}.code; \
+             nohup sh -c {} >/work/{label}.nohup 2>&1 &",
+            shell_quote_str(&format!(
+                "{} {} > /work/{label}.out 2> /work/{label}.err; echo $? > /work/{label}.code",
+                self.ssh_prefix(),
+                shell_quote_str(&remote),
+            )),
+        );
+
+        let output = self.exec_deployer(&script);
+        assert!(
+            output.success(),
+            "failed to start follow\nstdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    fn wait_follow(&self, label: &str, timeout: Duration) -> ContainerCommandOutput {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let code = self.exec_deployer(&format!("cat /work/{label}.code 2>/dev/null || true"));
+            if !code.stdout.trim().is_empty() {
+                let stdout =
+                    self.exec_deployer(&format!("cat /work/{label}.out 2>/dev/null || true"));
+                let stderr =
+                    self.exec_deployer(&format!("cat /work/{label}.err 2>/dev/null || true"));
+                return ContainerCommandOutput {
+                    code: code.stdout.trim().parse().unwrap_or(-1),
+                    stdout: stdout.stdout,
+                    stderr: stderr.stdout,
+                };
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        let stdout = self.exec_deployer(&format!("cat /work/{label}.out 2>/dev/null || true"));
+        let stderr = self.exec_deployer(&format!("cat /work/{label}.err 2>/dev/null || true"));
+        panic!(
+            "follow did not finish within {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+            stdout.stdout, stderr.stdout
+        );
+    }
+
+    fn follow_artifact(
+        &self,
+        label: &str,
+        artifact: &str,
+        timeout_seconds: u64,
+    ) -> ContainerCommandOutput {
+        self.start_follow(label, artifact, timeout_seconds);
+        self.wait_follow(label, Duration::from_secs(timeout_seconds + 10))
+    }
+
+    fn write_remote_config(&self, expected_status: u16) {
+        let config = ssh_deploy_config(expected_status);
+        let output = self.exec_deployer(&format!(
+            "cat > /work/doubleshot.toml <<'EOF'\n{config}\nEOF\n\
+             {} 'mkdir -p {REMOTE_HOME}/inbox {REMOTE_HOME}/www {REMOTE_HOME}/runtime {REMOTE_HOME}/releases && printf ok > {REMOTE_HOME}/www/index.html' && \
+             {} /work/doubleshot.toml {}@{}:{REMOTE_CONFIG}",
+            self.ssh_prefix(),
+            self.scp_prefix(),
+            SSH_USER,
+            SSH_HOST,
+        ));
+        assert!(
+            output.success(),
+            "remote config setup failed\nstdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    fn start_remote_serve(&self) {
+        let output = self.ssh(&format!(
+            "nohup doubleshot --config {REMOTE_CONFIG} serve > {REMOTE_HOME}/serve.log 2>&1 & echo $! > {REMOTE_HOME}/serve.pid"
+        ));
+        assert!(
+            output.success(),
+            "failed to start remote serve\nstdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+
+        let wait = self.exec_deployer(&format!(
+            "for i in $(seq 1 80); do \
+                 {} 'test -f {REMOTE_HOME}/serve.log && grep -q \"doubleshot watching\" {REMOTE_HOME}/serve.log' && exit 0; \
+                 sleep 0.1; \
+             done; \
+             {} 'cat {REMOTE_HOME}/serve.log 2>/dev/null || true'; \
+             exit 1",
+            self.ssh_prefix(),
+            self.ssh_prefix(),
+        ));
+        assert!(
+            wait.success(),
+            "serve did not become ready\nstdout:\n{}\nstderr:\n{}",
+            wait.stdout,
+            wait.stderr
+        );
+    }
+
+    fn ssh_prefix(&self) -> String {
+        format!(
+            "sshpass -p {} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {} {}@{}",
+            shell_quote_str(SSH_PASSWORD),
+            self.ssh_port,
+            SSH_USER,
+            SSH_HOST,
+        )
+    }
+
+    fn scp_prefix(&self) -> String {
+        format!(
+            "sshpass -p {} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P {}",
+            shell_quote_str(SSH_PASSWORD),
+            self.ssh_port,
+        )
+    }
+}
+
+fn exec_container_shell(
+    container: &Container<GenericImage>,
+    script: &str,
+) -> ContainerCommandOutput {
+    let mut result = container
+        .exec(ExecCommand::new(["sh", "-lc", script]).with_cmd_ready_condition(CmdWaitFor::exit()))
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout_to_vec().unwrap()).to_string();
+    let stderr = String::from_utf8_lossy(&result.stderr_to_vec().unwrap()).to_string();
+    let code = result.exit_code().unwrap().unwrap_or(-1);
+
+    ContainerCommandOutput {
+        code,
+        stdout,
+        stderr,
+    }
+}
+
+fn build_ssh_server_image() -> GenericImage {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    GenericBuildableImage::new("doubleshot-ssh-server", ssh_image_tag())
+        .with_dockerfile(manifest.join("tests/ssh/Dockerfile.server"))
+        .with_file(manifest.join("Cargo.toml"), "Cargo.toml")
+        .with_file(manifest.join("Cargo.lock"), "Cargo.lock")
+        .with_file(manifest.join("src"), "src")
+        .build_image_with(BuildImageOptions::new().with_skip_if_exists(true))
+        .unwrap()
+}
+
+fn build_ssh_deployer_image() -> GenericImage {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    GenericBuildableImage::new("doubleshot-ssh-deployer", ssh_image_tag())
+        .with_dockerfile(manifest.join("tests/ssh/Dockerfile.deployer"))
+        .build_image_with(BuildImageOptions::new().with_skip_if_exists(true))
+        .unwrap()
+}
+
+fn ssh_image_tag() -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut hasher = DefaultHasher::new();
+    for path in [
+        manifest.join("Cargo.toml"),
+        manifest.join("Cargo.lock"),
+        manifest.join("src/main.rs"),
+        manifest.join("tests/ssh/Dockerfile.server"),
+        manifest.join("tests/ssh/Dockerfile.deployer"),
+    ] {
+        path.display().to_string().hash(&mut hasher);
+        fs::read(path).unwrap().hash(&mut hasher);
+    }
+    format!("test-{:x}", hasher.finish())
+}
+
+fn ssh_deploy_config(expected_status: u16) -> String {
+    format!(
+        r#"
+home = "{REMOTE_HOME}"
+poll_seconds = 1
+shutdown_timeout_seconds = 1
+
+[slots.blue]
+port = {SSH_BLUE_PORT}
+
+[slots.green]
+port = {SSH_GREEN_PORT}
+
+[launch]
+command = "python3 -m http.server {{port}} --bind 127.0.0.1 --directory {REMOTE_HOME}/www # {{artifact}}"
+env_files = []
+
+[health]
+kind = "http"
+url = "http://127.0.0.1:{{port}}/"
+method = "GET"
+expected_status = {expected_status}
+timeout_seconds = 2
+interval_millis = 100
+
+[switch]
+kind = "nginx-proxy-pass-include"
+path = "{REMOTE_HOME}/proxy-pass.inc"
+reload_command = "true"
+host = "127.0.0.1"
+"#
+    )
+}
+
+fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn strip_note_comments(output: &str) -> String {
     output
         .lines()
@@ -226,6 +527,185 @@ fn start_http_echo(text: &str, status: u16) -> testcontainers::Container<Generic
         ])
         .start()
         .unwrap()
+}
+
+#[test]
+fn ssh_follow_streams_successful_inbox_deployment() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let rig = SshTestRig::start(200);
+    rig.start_follow("success", "app-success.jar", 20);
+    rig.upload_artifact("app-success.jar", "payload");
+
+    let output = rig.wait_follow("success", Duration::from_secs(30));
+
+    assert!(
+        output.success(),
+        "follow failed\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    for phase in [
+        "[started]",
+        "[imported]",
+        "[launching]",
+        "[waiting]",
+        "[ready]",
+        "[switching]",
+        "[succeeded]",
+    ] {
+        assert!(
+            output.stdout.contains(phase),
+            "missing {phase} in follow output:\n{}",
+            output.stdout
+        );
+    }
+}
+
+#[test]
+fn ssh_follow_reports_failed_health_and_serve_quarantines_artifact() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let rig = SshTestRig::start(418);
+    rig.start_follow("failure", "app-fail.jar", 15);
+    rig.upload_artifact("app-fail.jar", "payload");
+
+    let output = rig.wait_follow("failure", Duration::from_secs(25));
+    let state = rig.ssh(
+        "test ! -f /opt/doubleshot/runtime/active-slot && find /opt/doubleshot/inbox/failed -name '*app-fail.jar' -type f",
+    );
+
+    assert!(
+        !output.success(),
+        "follow unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output
+            .stdout
+            .contains("[failed] HTTP health check did not return 418"),
+        "unexpected follow output:\n{}",
+        output.stdout
+    );
+    assert!(
+        state.success(),
+        "failed artifact/state assertion failed\nstdout:\n{}\nstderr:\n{}",
+        state.stdout,
+        state.stderr
+    );
+    assert!(state.stdout.contains("app-fail.jar"));
+}
+
+#[test]
+fn ssh_status_reflects_remote_deployment_state() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let rig = SshTestRig::start(200);
+    rig.upload_artifact("app-status.jar", "payload");
+    let follow = rig.follow_artifact("status", "app-status.jar", 20);
+    assert!(
+        follow.success(),
+        "follow failed\nstdout:\n{}\nstderr:\n{}",
+        follow.stdout,
+        follow.stderr
+    );
+
+    let status = rig.ssh(&format!("doubleshot --config {REMOTE_CONFIG} status"));
+
+    assert!(
+        status.success(),
+        "status failed\nstdout:\n{}\nstderr:\n{}",
+        status.stdout,
+        status.stderr
+    );
+    assert!(status.stdout.contains("active slot: blue"));
+    assert!(
+        status
+            .stdout
+            .contains("active release: /opt/doubleshot/releases/")
+    );
+    assert!(status.stdout.contains("app-status.jar"));
+    assert!(status.stdout.contains("runtime: /opt/doubleshot/runtime"));
+    assert!(status.stdout.contains("blue port=18081 pid="));
+    assert!(status.stdout.contains("green port=18082 pid=not running"));
+}
+
+#[test]
+fn ssh_serve_deploys_two_artifacts_and_flips_slots() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let rig = SshTestRig::start(200);
+    rig.upload_artifact("app-blue.jar", "blue");
+    let first = rig.follow_artifact("blue", "app-blue.jar", 20);
+    rig.upload_artifact("app-green.jar", "green");
+    let second = rig.follow_artifact("green", "app-green.jar", 20);
+    let state =
+        rig.ssh("cat /opt/doubleshot/runtime/active-slot && cat /opt/doubleshot/proxy-pass.inc");
+
+    assert!(
+        first.success(),
+        "first follow failed\nstdout:\n{}\nstderr:\n{}",
+        first.stdout,
+        first.stderr
+    );
+    assert!(
+        second.success(),
+        "second follow failed\nstdout:\n{}\nstderr:\n{}",
+        second.stdout,
+        second.stderr
+    );
+    assert!(
+        first
+            .stdout
+            .contains("[succeeded] blue active on port 18081")
+    );
+    assert!(
+        second
+            .stdout
+            .contains("[succeeded] green active on port 18082")
+    );
+    assert!(
+        state.success(),
+        "state check failed\nstdout:\n{}\nstderr:\n{}",
+        state.stdout,
+        state.stderr
+    );
+    assert!(state.stdout.contains("green"));
+    assert!(state.stdout.contains("proxy_pass http://127.0.0.1:18082;"));
+}
+
+#[test]
+fn ssh_follow_times_out_for_missing_artifact() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let rig = SshTestRig::start(200);
+    let output = rig.follow_artifact("missing", "missing.jar", 2);
+
+    assert!(
+        !output.success(),
+        "missing follow unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("no deployment events arrived within timeout for missing.jar"),
+        "unexpected stderr:\n{}\nstdout:\n{}",
+        output.stderr,
+        output.stdout
+    );
 }
 
 fn tcp_get(port: u16, path: &str) -> String {

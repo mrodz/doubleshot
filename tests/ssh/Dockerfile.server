@@ -1,0 +1,32 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        openssh-server \
+        procps \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash deployer \
+    && echo 'deployer:doubleshot' | chpasswd \
+    && mkdir -p /run/sshd /opt/doubleshot \
+    && chown -R deployer:deployer /opt/doubleshot
+
+COPY --from=builder /src/target/release/doubleshot /usr/local/bin/doubleshot
+
+RUN printf '%s\n' \
+    'PasswordAuthentication yes' \
+    'PermitRootLogin no' \
+    'UsePAM no' \
+    > /etc/ssh/sshd_config.d/doubleshot.conf
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

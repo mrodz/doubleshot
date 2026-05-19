@@ -7,6 +7,36 @@ that watches an inbox, or it can deploy a local artifact directly. The app
 runtime, health check, slots, and traffic switch are configured instead of being
 hardcoded to one stack.
 
+## Installation
+
+**Pre-built binaries** are available on the [releases page](https://github.com/mrodz/doubleshot/releases). Download the archive for your platform, extract it, and place the binary somewhere on your `$PATH`:
+
+| Platform | Archive |
+|---|---|
+| macOS (Apple Silicon) | `doubleshot-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `doubleshot-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| Linux aarch64 (glibc) | `doubleshot-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 (musl) | `doubleshot-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
+| Linux x86_64 (glibc) | `doubleshot-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (musl) | `doubleshot-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
+
+```bash
+# example — adjust version and target triple as needed
+curl -LO https://github.com/mrodz/doubleshot/releases/download/vX.Y.Z/doubleshot-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf doubleshot-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+sudo mv doubleshot /usr/local/bin/
+```
+
+**Build from source** (requires Rust 1.85+):
+
+```bash
+cargo install doubleshot
+# or directly from the repository
+cargo install --git https://github.com/mrodz/doubleshot
+```
+
+---
+
 ## Commands
 
 ```bash

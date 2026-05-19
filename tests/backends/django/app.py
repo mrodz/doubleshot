@@ -75,9 +75,8 @@ if __name__ == "__main__":
     # Uvicorn acts as the production-ready ASGI server that listens 
     # for SIGTERM signals out of the box to finish ongoing requests.
     uvicorn.run(
-        "app:application", 
-        host="0.0.0.0", 
-        port=PORT, 
+        application,
+        host="0.0.0.0",
+        port=PORT,
         log_level="info",
-        workers=1
     )

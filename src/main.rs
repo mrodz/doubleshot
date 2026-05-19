@@ -559,24 +559,50 @@ impl Slots {
     }
 }
 
+#[derive(Debug)]
 struct DeployLock {
     path: PathBuf,
 }
 
 impl DeployLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                writeln!(file, "pid={}", std::process::id())?;
-                Ok(Self { path })
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "pid={}", std::process::id())?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path)? {
+                        match fs::remove_file(&path) {
+                            Ok(()) => continue,
+                            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                            Err(err) => return Err(err),
+                        }
+                    }
+
+                    return Err(io::Error::new(
+                        ErrorKind::WouldBlock,
+                        format!("deployment semaphore is held at {}", path.display()),
+                    ));
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => Err(io::Error::new(
-                ErrorKind::WouldBlock,
-                format!("deployment semaphore is held at {}", path.display()),
-            )),
-            Err(err) => Err(err),
         }
     }
+}
+
+fn lock_is_stale(path: &Path) -> io::Result<bool> {
+    let contents = fs::read_to_string(path)?;
+    let Some(pid) = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid="))
+        .map(str::trim)
+    else {
+        return Ok(false);
+    };
+
+    Ok(!pid.is_empty() && !process_exists(pid))
 }
 
 impl Drop for DeployLock {
@@ -1077,14 +1103,26 @@ fn deploy_artifact(
     let mut child = launch_slot(config, &context)?;
 
     if let Err(err) = wait_until_ready(config, &context, &mut child) {
-        let _ = stop_child(&mut child, config.shutdown_timeout);
+        let _ = stop_launched_slot(config, &mut child, &target.name);
         let _ = quarantine_failed_artifact(config, &release);
         return Err(err);
     }
 
-    promote(config, &context)?;
-    fs::write(config.active_slot_file(), &target.name)?;
-    fs::write(config.active_release_file(), release.display().to_string())?;
+    let previous_switch = capture_switch_state(config)?;
+    if let Err(err) = promote(config, &context) {
+        let _ = restore_switch_state(config, previous_switch);
+        let _ = stop_launched_slot(config, &mut child, &target.name);
+        let _ = quarantine_failed_artifact(config, &release);
+        return Err(err);
+    }
+
+    if let Err(err) = write_active_state(config, &target.name, &release) {
+        let _ = restore_switch_state(config, previous_switch);
+        let _ = stop_launched_slot(config, &mut child, &target.name);
+        let _ = quarantine_failed_artifact(config, &release);
+        return Err(err);
+    }
+
     slots.put(&target.name, child);
 
     if let Some(old_slot) = active_slot
@@ -1098,6 +1136,73 @@ fn deploy_artifact(
         slot_label(&target.name),
         target.port
     );
+    Ok(())
+}
+
+fn stop_launched_slot(config: &AppConfig, child: &mut Child, slot: &str) -> io::Result<()> {
+    let result = stop_child(child, config.shutdown_timeout);
+    let _ = fs::remove_file(config.pid_file(slot));
+    result
+}
+
+enum SwitchState {
+    NginxProxyPassInclude { contents: Option<Vec<u8>> },
+}
+
+fn capture_switch_state(config: &AppConfig) -> io::Result<SwitchState> {
+    match &config.switch {
+        SwitchConfig::NginxProxyPassInclude { path, .. } => match fs::read(path) {
+            Ok(contents) => Ok(SwitchState::NginxProxyPassInclude {
+                contents: Some(contents),
+            }),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                Ok(SwitchState::NginxProxyPassInclude { contents: None })
+            }
+            Err(err) => Err(err),
+        },
+    }
+}
+
+fn restore_switch_state(config: &AppConfig, previous: SwitchState) -> io::Result<()> {
+    match (&config.switch, previous) {
+        (
+            SwitchConfig::NginxProxyPassInclude {
+                path,
+                reload_command,
+                ..
+            },
+            SwitchState::NginxProxyPassInclude { contents },
+        ) => {
+            match contents {
+                Some(contents) => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let tmp = path.with_extension("tmp");
+                    fs::write(&tmp, contents)?;
+                    fs::rename(tmp, path)?;
+                }
+                None => match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                },
+            }
+            run_shell(reload_command).map(|_| ())
+        }
+    }
+}
+
+fn write_active_state(config: &AppConfig, slot: &str, release: &Path) -> io::Result<()> {
+    let active_slot = config.active_slot_file();
+    let active_release = config.active_release_file();
+    let active_slot_tmp = active_slot.with_extension("tmp");
+    let active_release_tmp = active_release.with_extension("tmp");
+
+    fs::write(&active_slot_tmp, slot)?;
+    fs::write(&active_release_tmp, release.display().to_string())?;
+    fs::rename(&active_slot_tmp, active_slot)?;
+    fs::rename(&active_release_tmp, active_release)?;
     Ok(())
 }
 
@@ -1447,6 +1552,8 @@ fn process_exists(pid: &str) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -1689,6 +1796,43 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    fn test_config(dir: &Path, blue_port: u16, green_port: u16) -> AppConfig {
+        AppConfig {
+            inbox_dir: dir.join("inbox"),
+            releases_dir: dir.join("releases"),
+            runtime_dir: dir.join("runtime"),
+            slots: vec![
+                SlotConfig {
+                    name: BLUE.to_string(),
+                    port: blue_port,
+                },
+                SlotConfig {
+                    name: GREEN.to_string(),
+                    port: green_port,
+                },
+            ],
+            launch: LaunchConfig {
+                command: "sleep 30 # {artifact} {port}".to_string(),
+                env_files: vec![],
+            },
+            health: HealthConfig::Http {
+                url: "http://127.0.0.1:{port}/health".to_string(),
+                method: "GET".to_string(),
+                expected_status: 200,
+                headers: HashMap::new(),
+                timeout_seconds: 2,
+                interval_millis: 50,
+            },
+            switch: SwitchConfig::NginxProxyPassInclude {
+                path: dir.join("proxy-pass.inc"),
+                reload_command: "true".to_string(),
+                host: "127.0.0.1".to_string(),
+            },
+            poll_interval: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(1),
+        }
+    }
+
     fn scan_nginx_fixture(
         name: &str,
         files: &[(&str, &str)],
@@ -1796,6 +1940,115 @@ mod tests {
         assert_eq!(target_slot(&config, None).unwrap().name, BLUE);
         assert_eq!(target_slot(&config, Some(BLUE)).unwrap().name, GREEN);
         assert_eq!(target_slot(&config, Some(GREEN)).unwrap().name, BLUE);
+    }
+
+    #[test]
+    fn ignores_unknown_active_slot_state() {
+        let dir = temp_test_dir("unknown-active-slot");
+        let config = test_config(&dir, 8081, 8082);
+        fs::create_dir_all(&config.runtime_dir).unwrap();
+        fs::write(config.active_slot_file(), "purple").unwrap();
+
+        assert_eq!(active_slot(&config).unwrap(), None);
+    }
+
+    #[test]
+    fn deploy_lock_rejects_live_owner() {
+        let dir = temp_test_dir("live-lock");
+        let path = dir.join("deploy.lock");
+        fs::write(&path, format!("pid={}\n", std::process::id())).unwrap();
+
+        let err = DeployLock::acquire(path).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn deploy_lock_recovers_dead_owner() {
+        let dir = temp_test_dir("stale-lock");
+        let path = dir.join("deploy.lock");
+        fs::write(&path, "pid=999999999\n").unwrap();
+
+        let lock = DeployLock::acquire(path.clone()).unwrap();
+
+        assert!(fs::read_to_string(&path).unwrap().contains("pid="));
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn parses_env_files_with_quotes_and_rejects_invalid_lines() {
+        let dir = temp_test_dir("env-files");
+        let valid = dir.join("valid.env");
+        write_fixture(
+            &valid,
+            r#"
+# comment
+PLAIN=value
+DOUBLE="quoted value"
+SINGLE='single quoted'
+"#,
+        );
+
+        assert_eq!(
+            read_env_file(&valid).unwrap(),
+            vec![
+                ("PLAIN".to_string(), "value".to_string()),
+                ("DOUBLE".to_string(), "quoted value".to_string()),
+                ("SINGLE".to_string(), "single quoted".to_string()),
+            ]
+        );
+
+        let invalid = dir.join("invalid.env");
+        write_fixture(&invalid, "NOT_A_PAIR\n");
+        assert_eq!(
+            read_env_file(&invalid).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn failed_promotion_restores_switch_and_stops_new_slot() {
+        let dir = temp_test_dir("failed-promotion-cleanup");
+        let mut config = test_config(&dir, 18081, 18082);
+        config.switch = SwitchConfig::NginxProxyPassInclude {
+            path: dir.join("proxy-pass.inc"),
+            reload_command: "false".to_string(),
+            host: "127.0.0.1".to_string(),
+        };
+        config.ensure_dirs().unwrap();
+        write_fixture(&config.active_slot_file(), BLUE);
+        write_fixture(&config.active_release_file(), "/old/release.jar");
+        write_fixture(
+            &dir.join("proxy-pass.inc"),
+            "proxy_pass http://127.0.0.1:18081;\n",
+        );
+        let release = dir.join("releases/artifact.txt");
+        write_fixture(&release, "payload");
+        let context = RenderContext {
+            artifact: &release,
+            port: 18082,
+            slot: GREEN,
+            release: &release,
+        };
+        let mut child = launch_slot(&config, &context).unwrap();
+
+        let previous_switch = capture_switch_state(&config).unwrap();
+        let err = promote(&config, &context).unwrap_err();
+        assert!(restore_switch_state(&config, previous_switch).is_err());
+        stop_launched_slot(&config, &mut child, GREEN).unwrap();
+
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(fs::read_to_string(config.active_slot_file()).unwrap(), BLUE);
+        assert_eq!(
+            fs::read_to_string(config.active_release_file()).unwrap(),
+            "/old/release.jar"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("proxy-pass.inc")).unwrap(),
+            "proxy_pass http://127.0.0.1:18081;\n"
+        );
+        assert!(!config.pid_file(GREEN).exists());
     }
 
     #[test]

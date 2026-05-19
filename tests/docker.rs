@@ -6,7 +6,10 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
     time::{SystemTime, UNIX_EPOCH},
@@ -226,15 +229,20 @@ fn start_http_echo(text: &str, status: u16) -> testcontainers::Container<Generic
 }
 
 fn tcp_get(port: u16, path: &str) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    tcp_get_result(port, path).unwrap()
+}
+
+fn tcp_get_result(port: u16, path: &str) -> io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
+    )?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    response
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn available_port() -> u16 {
@@ -522,6 +530,104 @@ http {
 }
 
 #[test]
+#[ignore = "stress-style Docker test; run explicitly when validating reload behavior under load"]
+fn nginx_reload_under_load_has_no_bad_gateway_responses() {
+    if skip_without_docker() {
+        return;
+    }
+
+    let blue = start_http_echo("blue", 200);
+    let green = start_http_echo("green", 200);
+    let blue_port = blue.get_host_port_ipv4(5678.tcp()).unwrap();
+    let green_port = green.get_host_port_ipv4(5678.tcp()).unwrap();
+    let dir = temp_dir("nginx-reload-load");
+    write_file(
+        &dir.join("nginx.conf"),
+        r#"
+events {}
+http {
+    server {
+        listen 80;
+        location / {
+            include /tmp/doubleshot-nginx/proxy-pass.inc;
+        }
+    }
+}
+"#,
+    );
+    write_file(
+        &dir.join("proxy-pass.inc"),
+        &format!("proxy_pass http://host.testcontainers.internal:{blue_port};\n"),
+    );
+
+    let nginx = GenericImage::new("nginx", "1.27-alpine")
+        .with_exposed_port(80.tcp())
+        .with_wait_for(WaitFor::seconds(2))
+        .with_host("host.testcontainers.internal", Host::HostGateway)
+        .with_mount(Mount::bind_mount(
+            dir.to_str().unwrap(),
+            "/tmp/doubleshot-nginx",
+        ))
+        .with_cmd([
+            "nginx",
+            "-c",
+            "/tmp/doubleshot-nginx/nginx.conf",
+            "-g",
+            "daemon off;",
+        ])
+        .start()
+        .unwrap();
+    let nginx_port = nginx.get_host_port_ipv4(80.tcp()).unwrap();
+    assert!(tcp_get(nginx_port, "/").contains("blue"));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let total = Arc::new(AtomicUsize::new(0));
+    let bad = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        let stop = Arc::clone(&stop);
+        let total = Arc::clone(&total);
+        let bad = Arc::clone(&bad);
+        workers.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match tcp_get_result(nginx_port, "/") {
+                    Ok(response)
+                        if response.contains("200 OK")
+                            && (response.contains("blue") || response.contains("green")) => {}
+                    _ => {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                total.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    thread::sleep(Duration::from_millis(500));
+    write_file(
+        &dir.join("proxy-pass.inc"),
+        &format!("proxy_pass http://host.testcontainers.internal:{green_port};\n"),
+    );
+    let reload = Command::new("docker")
+        .args(["kill", "--signal=HUP", nginx.id()])
+        .output()
+        .unwrap();
+    assert_success(&reload);
+    thread::sleep(Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert!(
+        total.load(Ordering::Relaxed) > 100,
+        "load generator did not issue enough requests"
+    );
+    assert_eq!(bad.load(Ordering::Relaxed), 0);
+    assert!(tcp_get(nginx_port, "/").contains("green"));
+}
+
+#[test]
 fn init_config_from_nginx_output_is_valid_toml() {
     if skip_without_docker() {
         return;
@@ -579,6 +685,77 @@ fn direct_deploy_promotes_first_slot_against_http_container() {
         fs::read_to_string(dir.join("proxy-pass.inc")).unwrap(),
         "proxy_pass http://127.0.0.1:8991;\n"
     );
+}
+
+#[test]
+fn concurrent_deploy_rejects_second_runner_without_state_drift() {
+    let dir = temp_dir("deploy-concurrent");
+    if Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping concurrent deploy test because python3 was not found on PATH");
+        return;
+    }
+
+    let first_artifact = dir.join("first.txt");
+    let second_artifact = dir.join("second.txt");
+    write_file(&first_artifact, "first");
+    write_file(&second_artifact, "second");
+    let config = dir.join("doubleshot.toml");
+    let blue_port = available_port();
+    let green_port = available_port();
+    write_slow_deploy_config(&config, &dir, blue_port, green_port);
+
+    let first = Command::new(BIN)
+        .args([
+            "deploy",
+            first_artifact.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lock_file = dir.join("runtime/deploy.lock");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock_file.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(lock_file.exists(), "first deploy did not acquire the lock");
+    let second = run_doubleshot(&[
+        "deploy",
+        second_artifact.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    let first = first.wait_with_output().unwrap();
+
+    assert_success(&first);
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("deployment semaphore is held"),
+        "unexpected second deploy stderr:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("runtime/active-slot")).unwrap(),
+        "blue"
+    );
+    assert!(
+        fs::read_to_string(dir.join("runtime/active-release"))
+            .unwrap()
+            .contains("first.txt")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("proxy-pass.inc")).unwrap(),
+        format!("proxy_pass http://127.0.0.1:{blue_port};\n")
+    );
+    cleanup_runtime_pids(&dir);
 }
 
 #[test]
@@ -994,6 +1171,44 @@ fn build_springboot_backend() -> Option<SpringbootBackend> {
 
 fn write_deploy_config(path: &Path, dir: &Path, status: u16, blue_port: u16, green_port: u16) {
     write_deploy_config_with_expected(path, dir, status, status, blue_port, green_port);
+}
+
+fn write_slow_deploy_config(path: &Path, dir: &Path, blue_port: u16, green_port: u16) {
+    write_file(
+        path,
+        &format!(
+            r#"
+home = "{home}"
+poll_seconds = 1
+shutdown_timeout_seconds = 1
+
+[slots.blue]
+port = {blue_port}
+
+[slots.green]
+port = {green_port}
+
+[launch]
+command = "sh -c 'sleep 2; exec python3 -m http.server {{port}} --bind 127.0.0.1 --directory {home}' # {{artifact}}"
+env_files = []
+
+[health]
+kind = "http"
+url = "http://127.0.0.1:{{port}}/"
+method = "GET"
+expected_status = 200
+timeout_seconds = 8
+interval_millis = 100
+
+[switch]
+kind = "nginx-proxy-pass-include"
+path = "{home}/proxy-pass.inc"
+reload_command = "true"
+host = "127.0.0.1"
+"#,
+            home = dir.display(),
+        ),
+    );
 }
 
 fn write_deploy_config_with_expected(

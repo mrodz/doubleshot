@@ -285,12 +285,11 @@ impl SshTestRig {
             .start()
             .unwrap();
 
-        let rig = Self {
+        Self {
             _server: server,
             deployer,
             ssh_port,
-        };
-        rig
+        }
     }
 
     fn ssh(&self, remote_command: &str) -> ContainerCommandOutput {

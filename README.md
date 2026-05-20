@@ -7,6 +7,37 @@ that watches an inbox, or it can deploy a local artifact directly. The app
 runtime, health check, slots, and traffic switch are configured instead of being
 hardcoded to one stack.
 
+## Management
+
+Linux release archives include scripts for updating, installing, and removing a
+systemd-managed `doubleshot` daemon. Download and extract the archive for your
+platform first, then run the script you need:
+
+```bash
+# update the binary while preserving doubleshot.toml and the service unit
+./update.sh --version vX.Y.Z
+
+# install the binary, runtime directories, config, and systemd unit
+./install.sh --version vX.Y.Z
+
+# uninstall the service, sudoers rule, and binary
+./uninstall.sh
+
+# uninstall and remove /opt/doubleshot plus the nginx include directory
+./uninstall.sh --purge
+```
+
+Set prompt defaults through environment variables for non-interactive installs:
+
+```bash
+DOUBLESHOT_HOME=/opt/doubleshot \
+DOUBLESHOT_USER=doubleshot \
+APP_TYPE=spring-boot \
+APP_ENV_FILE=/opt/myapp/prod.env \
+JAVA_BIN=/usr/bin/java \
+./install.sh --version vX.Y.Z
+```
+
 ## Installation
 
 **Pre-built binaries** are available on the [releases page](https://github.com/mrodz/doubleshot/releases). Download the archive for your platform, extract it, and place the binary somewhere on your `$PATH`:

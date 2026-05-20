@@ -1,6 +1,6 @@
-ec3068a5ad0ab6323122b747af0251dde8c0dc3c42bb5162ea36081b6055de2c  doubleshot-v1.0.0-aarch64-apple-darwin.tar.gz
-39940acce03983c97395f04e404b9b1b51206f0e3276b287afc68252efb2735f  doubleshot-v1.0.0-aarch64-unknown-linux-gnu.tar.gz
-4a2238baf83670b66287af57a26f1bae2fe69b28b8af7bc6c4e8b13ffce65b96  doubleshot-v1.0.0-aarch64-unknown-linux-musl.tar.gz
-24c3f2adabdbb6f6b0f411c2cdb79f3d2935f02e5d7ba8d575008739886eba06  doubleshot-v1.0.0-x86_64-apple-darwin.tar.gz
-dbc9a9eba48040da5b79a24869351149fde4258906dcdb97f7a89c7c94af7811  doubleshot-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
-e7bb64d77d95f70e3b4572fcfd1c76721d65696d2e2841cb9c34297a8037e1a2  doubleshot-v1.0.0-x86_64-unknown-linux-musl.tar.gz
+ad780c09147a1a7356029d3f90b09fefaba858e0c980f0d44333f80e4bf302c4  doubleshot-v1.1.0-aarch64-apple-darwin.tar.gz
+a25c8c611ef616d5cb42ede515c64bc7653803bc19b5943ad892e5857e0d22ef  doubleshot-v1.1.0-aarch64-unknown-linux-gnu.tar.gz
+542611d974fbba5bef5bcfd97c9e651819db0db9d5e7fb984e61797985931e50  doubleshot-v1.1.0-aarch64-unknown-linux-musl.tar.gz
+4c706804fe41b3e7949cf115bd056d3c53bc77940e8700ff532072f927d696c9  doubleshot-v1.1.0-x86_64-apple-darwin.tar.gz
+e77a6ee03f3b48c84b64d37081429ed219daacba424681434380b0ca3b706309  doubleshot-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
+d6e3709f264d2459df90266ac2882d35411ebb3f8d81af07c2368078244925c4  doubleshot-v1.1.0-x86_64-unknown-linux-musl.tar.gz

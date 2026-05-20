@@ -1213,11 +1213,10 @@ fn deploy_artifact(
 
     if let Some(old_slot) = active_slot
         && old_slot != target.name
+        && let Err(err) = stop_slot_if_running(config, slots, &old_slot)
     {
-        if let Err(err) = stop_slot_if_running(config, slots, &old_slot) {
-            record_deploy_event(config, &deploy_name, "failed", &err.to_string());
-            return Err(err);
-        }
+        record_deploy_event(config, &deploy_name, "failed", &err.to_string());
+        return Err(err);
     }
 
     println!(

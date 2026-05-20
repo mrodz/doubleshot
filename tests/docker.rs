@@ -36,6 +36,7 @@ const SSH_GREEN_PORT: u16 = 18082;
 enum DockerAvailability {
     Available,
     Unavailable(String),
+    CannotBuildImages(String),
 }
 
 fn docker_availability() -> DockerAvailability {
@@ -72,28 +73,52 @@ fn docker_availability() -> DockerAvailability {
                 );
             }
 
-            match GenericImage::new("alpine", "3.20")
-            .with_wait_for(WaitFor::seconds(1))
-            .with_cmd(["sh", "-c", "true"])
-            .start()
+            if let Err(err) = GenericImage::new("alpine", "3.20")
+                .with_wait_for(WaitFor::seconds(1))
+                .with_cmd(["sh", "-c", "true"])
+                .start()
             {
-                Ok(_) => DockerAvailability::Available,
-                Err(err) => DockerAvailability::Unavailable(format!(
+                return DockerAvailability::Unavailable(format!(
                     "Docker daemon is reachable, but testcontainers could not start a probe container: {err}"
+                ));
+            }
+
+            match build_probe_image() {
+                Ok(()) => DockerAvailability::Available,
+                Err(err) => DockerAvailability::CannotBuildImages(format!(
+                    "Docker daemon is reachable, but docker-tests cannot build Docker images: {err}"
                 )),
             }
         })
         .clone()
 }
 
-fn skip_without_docker() -> bool {
+fn require_docker() {
     match docker_availability() {
-        DockerAvailability::Available => false,
+        DockerAvailability::Available => (),
         DockerAvailability::Unavailable(reason) => {
-            eprintln!("skipping docker-backed assertion: {reason}");
-            true
+            panic!("docker-tests require Docker, but it is unavailable: {reason}");
+        }
+        DockerAvailability::CannotBuildImages(reason) => {
+            panic!("{reason}");
         }
     }
+}
+
+fn build_probe_image() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = temp_dir("image-build-probe");
+    write_file(&dir.join("Dockerfile"), "FROM alpine:3.20\nRUN true\n");
+
+    let tag = format!(
+        "probe-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+
+    GenericBuildableImage::new("doubleshot-image-build-probe", tag)
+        .with_dockerfile(dir.join("Dockerfile"))
+        .build_image_with(BuildImageOptions::new())
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 fn docker_daemon_running() -> bool {
@@ -237,6 +262,13 @@ struct SshTestRig {
 
 impl SshTestRig {
     fn start(expected_status: u16) -> Self {
+        let rig = Self::start_empty();
+        rig.write_remote_config(&ssh_deploy_config(expected_status));
+        rig.start_remote_serve();
+        rig
+    }
+
+    fn start_empty() -> Self {
         let server_image = build_ssh_server_image();
         let deployer_image = build_ssh_deployer_image();
 
@@ -258,8 +290,6 @@ impl SshTestRig {
             deployer,
             ssh_port,
         };
-        rig.write_remote_config(expected_status);
-        rig.start_remote_serve();
         rig
     }
 
@@ -350,8 +380,7 @@ impl SshTestRig {
         self.wait_follow(label, Duration::from_secs(timeout_seconds + 10))
     }
 
-    fn write_remote_config(&self, expected_status: u16) {
-        let config = ssh_deploy_config(expected_status);
+    fn write_remote_config(&self, config: &str) {
         let output = self.exec_deployer(&format!(
             "cat > /work/doubleshot.toml <<'EOF'\n{config}\nEOF\n\
              {} 'mkdir -p {REMOTE_HOME}/inbox {REMOTE_HOME}/www {REMOTE_HOME}/runtime {REMOTE_HOME}/releases && printf ok > {REMOTE_HOME}/www/index.html' && \
@@ -504,6 +533,40 @@ host = "127.0.0.1"
     )
 }
 
+fn ssh_django_deploy_config() -> String {
+    format!(
+        r#"
+home = "{REMOTE_HOME}"
+poll_seconds = 1
+shutdown_timeout_seconds = 5
+
+[slots.blue]
+port = {SSH_BLUE_PORT}
+
+[slots.green]
+port = {SSH_GREEN_PORT}
+
+[launch]
+command = "env PORT={{port}} APP_VERSION={{slot}} STARTUP_DELAY=8 python3 {{artifact}}"
+env_files = []
+
+[health]
+kind = "http"
+url = "http://127.0.0.1:{{port}}/health"
+method = "GET"
+expected_status = 200
+timeout_seconds = 30
+interval_millis = 250
+
+[switch]
+kind = "nginx-proxy-pass-include"
+path = "{REMOTE_HOME}/proxy-pass.inc"
+reload_command = "true"
+host = "127.0.0.1"
+"#
+    )
+}
+
 fn shell_quote_str(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -531,9 +594,7 @@ fn start_http_echo(text: &str, status: u16) -> testcontainers::Container<Generic
 
 #[test]
 fn ssh_follow_streams_successful_inbox_deployment() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let rig = SshTestRig::start(200);
     rig.start_follow("success", "app-success.jar", 20);
@@ -566,9 +627,7 @@ fn ssh_follow_streams_successful_inbox_deployment() {
 
 #[test]
 fn ssh_follow_reports_failed_health_and_serve_quarantines_artifact() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let rig = SshTestRig::start(418);
     rig.start_follow("failure", "app-fail.jar", 15);
@@ -603,9 +662,7 @@ fn ssh_follow_reports_failed_health_and_serve_quarantines_artifact() {
 
 #[test]
 fn ssh_status_reflects_remote_deployment_state() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let rig = SshTestRig::start(200);
     rig.upload_artifact("app-status.jar", "payload");
@@ -639,9 +696,7 @@ fn ssh_status_reflects_remote_deployment_state() {
 
 #[test]
 fn ssh_serve_deploys_two_artifacts_and_flips_slots() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let rig = SshTestRig::start(200);
     rig.upload_artifact("app-blue.jar", "blue");
@@ -685,9 +740,7 @@ fn ssh_serve_deploys_two_artifacts_and_flips_slots() {
 
 #[test]
 fn ssh_follow_times_out_for_missing_artifact() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let rig = SshTestRig::start(200);
     let output = rig.follow_artifact("missing", "missing.jar", 2);
@@ -765,9 +818,7 @@ fn direct_proxy_config_from_port(port: u16) -> (PathBuf, PathBuf) {
 
 #[test]
 fn nginx_scan_detects_direct_proxy_pass() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let backend = start_http_echo("direct", 200);
     let port = backend.get_host_port_ipv4(5678.tcp()).unwrap();
@@ -788,9 +839,7 @@ fn nginx_scan_detects_direct_proxy_pass() {
 
 #[test]
 fn nginx_scan_detects_named_upstream() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let backend = start_http_echo("upstream", 200);
     let port = backend.get_host_port_ipv4(5678.tcp()).unwrap();
@@ -832,9 +881,7 @@ http {{
 
 #[test]
 fn nginx_scan_follows_conf_d_include() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let backend = start_http_echo("include", 200);
     let port = backend.get_host_port_ipv4(5678.tcp()).unwrap();
@@ -868,9 +915,7 @@ server {{
 
 #[test]
 fn nginx_scan_server_name_hint_ranks_target() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let first = start_http_echo("first", 200);
     let wanted = start_http_echo("wanted", 200);
@@ -917,9 +962,7 @@ http {{
 
 #[test]
 fn nginx_container_validates_generated_proxy_include() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let dir = temp_dir("nginx-validate");
     write_file(
@@ -960,9 +1003,7 @@ http {
 
 #[test]
 fn nginx_container_proxies_to_http_backend() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let backend = start_http_echo("proxied", 200);
     let backend_port = backend.get_host_port_ipv4(5678.tcp()).unwrap();
@@ -1012,9 +1053,7 @@ http {
 #[test]
 #[ignore = "stress-style Docker test; run explicitly when validating reload behavior under load"]
 fn nginx_reload_under_load_has_no_bad_gateway_responses() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let blue = start_http_echo("blue", 200);
     let green = start_http_echo("green", 200);
@@ -1109,9 +1148,7 @@ http {
 
 #[test]
 fn init_config_from_nginx_output_is_valid_toml() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let backend = start_http_echo("toml", 200);
     let port = backend.get_host_port_ipv4(5678.tcp()).unwrap();
@@ -1134,9 +1171,7 @@ fn init_config_from_nginx_output_is_valid_toml() {
 
 #[test]
 fn direct_deploy_promotes_first_slot_against_http_container() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let dir = temp_dir("deploy-success");
     let artifact = dir.join("artifact.txt");
@@ -1170,16 +1205,17 @@ fn direct_deploy_promotes_first_slot_against_http_container() {
 #[test]
 fn concurrent_deploy_rejects_second_runner_without_state_drift() {
     let dir = temp_dir("deploy-concurrent");
-    if Command::new("python3")
+    let python_available = Command::new("python3")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_err()
-    {
-        eprintln!("skipping concurrent deploy test because python3 was not found on PATH");
-        return;
-    }
+        .map(|status| status.success())
+        .unwrap_or(false);
+    assert!(
+        python_available,
+        "python3 is required for concurrent deploy tests"
+    );
 
     let first_artifact = dir.join("first.txt");
     let second_artifact = dir.join("second.txt");
@@ -1240,9 +1276,7 @@ fn concurrent_deploy_rejects_second_runner_without_state_drift() {
 
 #[test]
 fn http_health_success_accepts_expected_status() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let dir = temp_dir("health-success");
     let artifact = dir.join("artifact.txt");
@@ -1266,9 +1300,7 @@ fn http_health_success_accepts_expected_status() {
 
 #[test]
 fn http_health_failure_blocks_promotion() {
-    if skip_without_docker() {
-        return;
-    }
+    require_docker();
 
     let dir = temp_dir("health-failure");
     let artifact = dir.join("artifact.txt");
@@ -1290,9 +1322,8 @@ fn http_health_failure_blocks_promotion() {
 
 #[test]
 fn springboot_backend_waits_for_readiness_before_promotion() {
-    let Some(backend) = build_springboot_backend() else {
-        return;
-    };
+    let backend =
+        build_springboot_backend().expect("Spring Boot backend test prerequisites were not met");
 
     let dir = temp_dir("springboot-deploy");
     let config = dir.join("doubleshot.toml");
@@ -1331,9 +1362,7 @@ fn springboot_backend_waits_for_readiness_before_promotion() {
 
 #[test]
 fn node_backend_waits_for_readiness_before_promotion() {
-    let Some(backend) = build_node_backend() else {
-        return;
-    };
+    let backend = build_node_backend().expect("Node backend test prerequisites were not met");
 
     let dir = temp_dir("node-deploy");
     let config = dir.join("doubleshot.toml");
@@ -1374,9 +1403,7 @@ fn node_backend_waits_for_readiness_before_promotion() {
 
 #[test]
 fn axum_backend_waits_for_readiness_before_promotion() {
-    let Some(backend) = build_axum_backend() else {
-        return;
-    };
+    let backend = build_axum_backend().expect("Axum backend test prerequisites were not met");
 
     let dir = temp_dir("axum-deploy");
     let config = dir.join("doubleshot.toml");
@@ -1416,44 +1443,50 @@ fn axum_backend_waits_for_readiness_before_promotion() {
 
 #[test]
 fn django_backend_waits_for_readiness_before_promotion() {
-    let Some(backend) = build_django_backend() else {
-        return;
-    };
+    require_docker();
 
-    let dir = temp_dir("django-deploy");
-    let config = dir.join("doubleshot.toml");
-    let blue_port = available_port();
-    let green_port = available_port();
-    write_django_deploy_config(&config, &dir, &backend.python, blue_port, green_port);
+    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backends/django/app.py");
+    let rig = SshTestRig::start_empty();
+    rig.write_remote_config(&ssh_django_deploy_config());
+    rig.upload_artifact("django-app.py", &fs::read_to_string(app).unwrap());
 
+    let deploy_command =
+        format!("doubleshot --config {REMOTE_CONFIG} deploy {REMOTE_HOME}/inbox/django-app.py");
     let started = Instant::now();
-    let output = run_doubleshot(&[
-        "deploy",
-        backend.artifact.to_str().unwrap(),
-        "--config",
-        config.to_str().unwrap(),
-    ]);
+    let output = rig.ssh(&deploy_command);
     let elapsed = started.elapsed();
 
-    assert_success(&output);
+    assert!(
+        output.success(),
+        "Django deploy failed\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
     assert!(
         elapsed >= Duration::from_secs(7),
         "deployment promoted before the slow Django startup completed; elapsed={elapsed:?}"
     );
     assert_eq!(
-        fs::read_to_string(dir.join("runtime/active-slot")).unwrap(),
+        rig.ssh(&format!("cat {REMOTE_HOME}/runtime/active-slot"))
+            .stdout
+            .trim(),
         "blue"
     );
     assert_eq!(
-        fs::read_to_string(dir.join("proxy-pass.inc")).unwrap(),
-        format!("proxy_pass http://127.0.0.1:{blue_port};\n")
+        rig.ssh(&format!("cat {REMOTE_HOME}/proxy-pass.inc")).stdout,
+        format!("proxy_pass http://127.0.0.1:{SSH_BLUE_PORT};\n")
     );
 
-    let response = tcp_get(blue_port, "/");
-    assert!(response.contains("200"));
-    assert!(response.contains("Hello from version: blue"));
-
-    cleanup_runtime_pids(&dir);
+    let response = rig.ssh(&format!(
+        "python3 -c 'import urllib.request; print(urllib.request.urlopen(\"http://127.0.0.1:{SSH_BLUE_PORT}/\").read().decode(), end=\"\")'"
+    ));
+    assert!(
+        response.success(),
+        "Django response check failed\nstdout:\n{}\nstderr:\n{}",
+        response.stdout,
+        response.stderr
+    );
+    assert!(response.stdout.contains("Hello from version: blue"));
 }
 
 struct SpringbootBackend {
@@ -1470,70 +1503,6 @@ struct AxumBackend {
     artifact: PathBuf,
 }
 
-struct DjangoBackend {
-    artifact: PathBuf,
-    python: PathBuf,
-}
-
-fn build_django_backend() -> Option<DjangoBackend> {
-    let app_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backends/django");
-    let artifact = app_dir.join("app.py");
-    if !artifact.is_file() {
-        eprintln!(
-            "skipping Django backend test because {} does not exist",
-            artifact.display()
-        );
-        return None;
-    }
-
-    let python = python3_path()?;
-    let output = Command::new(&python)
-        .args(["-c", "import django, uvicorn"])
-        .output();
-
-    let Ok(output) = output else {
-        eprintln!("skipping Django backend test because python3 was not runnable");
-        return None;
-    };
-
-    if !output.status.success() {
-        eprintln!(
-            "skipping Django backend test because django or uvicorn is not installed for {}\nstderr:\n{}",
-            python.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    Some(DjangoBackend { artifact, python })
-}
-
-fn python3_path() -> Option<PathBuf> {
-    let output = Command::new("python3")
-        .args(["-c", "import sys; print(sys.executable)"])
-        .output();
-
-    let Ok(output) = output else {
-        eprintln!("skipping Django backend test because python3 was not found on PATH");
-        return None;
-    };
-
-    if !output.status.success() {
-        eprintln!(
-            "skipping Django backend test because python3 failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    stdout(&output)
-        .lines()
-        .last()
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-}
-
 fn build_axum_backend() -> Option<AxumBackend> {
     let app_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backends/axum");
     let output = Command::new("cargo")
@@ -1542,13 +1511,13 @@ fn build_axum_backend() -> Option<AxumBackend> {
         .output();
 
     let Ok(output) = output else {
-        eprintln!("skipping Axum backend test because cargo was not found on PATH");
+        eprintln!("cannot run Axum backend test because cargo was not found on PATH");
         return None;
     };
 
     if !output.status.success() {
         eprintln!(
-            "skipping Axum backend test because cargo build failed\nstdout:\n{}\nstderr:\n{}",
+            "cannot run Axum backend test because cargo build failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1558,7 +1527,7 @@ fn build_axum_backend() -> Option<AxumBackend> {
     let artifact = app_dir.join("target/debug/axum");
     if !artifact.is_file() {
         eprintln!(
-            "skipping Axum backend test because cargo did not produce {}",
+            "cannot run Axum backend test because cargo did not produce {}",
             artifact.display()
         );
         return None;
@@ -1575,7 +1544,7 @@ fn build_node_backend() -> Option<NodeBackend> {
         .status()
         .is_err()
     {
-        eprintln!("skipping Node backend test because node was not found on PATH");
+        eprintln!("cannot run Node backend test because node was not found on PATH");
         return None;
     }
 
@@ -1589,13 +1558,13 @@ fn build_node_backend() -> Option<NodeBackend> {
             .output();
 
         let Ok(output) = output else {
-            eprintln!("skipping Node backend test because npm was not found on PATH");
+            eprintln!("cannot run Node backend test because npm was not found on PATH");
             return None;
         };
 
         if !output.status.success() {
             eprintln!(
-                "skipping Node backend test because npm ci failed\nstdout:\n{}\nstderr:\n{}",
+                "cannot run Node backend test because npm ci failed\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -1621,7 +1590,7 @@ fn build_springboot_backend() -> Option<SpringbootBackend> {
 
     if !output.status.success() {
         eprintln!(
-            "skipping Spring Boot backend test because bootJar failed\nstdout:\n{}\nstderr:\n{}",
+            "cannot run Spring Boot backend test because bootJar failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1636,7 +1605,7 @@ fn build_springboot_backend() -> Option<SpringbootBackend> {
 
     let Some(java) = java else {
         eprintln!(
-            "skipping Spring Boot backend test because Gradle did not report a Java 25 launcher\nstdout:\n{}\nstderr:\n{}",
+            "cannot run Spring Boot backend test because Gradle did not report a Java 25 launcher\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1867,51 +1836,6 @@ reload_command = "true"
 host = "127.0.0.1"
 "#,
             home = dir.display(),
-        ),
-    );
-}
-
-fn write_django_deploy_config(
-    path: &Path,
-    dir: &Path,
-    python: &Path,
-    blue_port: u16,
-    green_port: u16,
-) {
-    write_file(
-        path,
-        &format!(
-            r#"
-home = "{home}"
-poll_seconds = 1
-shutdown_timeout_seconds = 5
-
-[slots.blue]
-port = {blue_port}
-
-[slots.green]
-port = {green_port}
-
-[launch]
-command = "env PORT={{port}} APP_VERSION={{slot}} STARTUP_DELAY=8 {python} {{artifact}}"
-env_files = []
-
-[health]
-kind = "http"
-url = "http://127.0.0.1:{{port}}/health"
-method = "GET"
-expected_status = 200
-timeout_seconds = 30
-interval_millis = 250
-
-[switch]
-kind = "nginx-proxy-pass-include"
-path = "{home}/proxy-pass.inc"
-reload_command = "true"
-host = "127.0.0.1"
-"#,
-            home = dir.display(),
-            python = shell_quote(python),
         ),
     );
 }

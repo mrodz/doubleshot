@@ -89,6 +89,45 @@ latest_version() {
     | head -1
 }
 
+semver_major() {
+  sed -n 's/.*[^0-9v]v\{0,1\}\([0-9][0-9]*\)\.[0-9][0-9]*\.[0-9][0-9]*.*/\1/p; s/^v\{0,1\}\([0-9][0-9]*\)\.[0-9][0-9]*\.[0-9][0-9]*.*/\1/p' \
+    | head -1
+}
+
+installed_version() {
+  if [[ ! -x "$BIN_PATH" ]]; then
+    echo "cannot determine current doubleshot version because $BIN_PATH is not executable" >&2
+    exit 1
+  fi
+
+  "$BIN_PATH" --version
+}
+
+prevent_major_version_change() {
+  local current_version="$1"
+  local target_version="$2"
+  local current_major
+  local target_major
+
+  current_major="$(printf '%s\n' "$current_version" | semver_major)"
+  target_major="$(printf '%s\n' "$target_version" | semver_major)"
+
+  if [[ -z "$current_major" ]]; then
+    echo "failed to parse current doubleshot version: $current_version" >&2
+    exit 1
+  fi
+
+  if [[ -z "$target_major" ]]; then
+    echo "failed to parse target doubleshot version: $target_version" >&2
+    exit 1
+  fi
+
+  if [[ "$current_major" != "$target_major" ]]; then
+    echo "refusing to update across major versions: $current_version -> $target_version" >&2
+    exit 1
+  fi
+}
+
 download_release() {
   local version="$1"
   local target="$2"
@@ -129,6 +168,8 @@ if [[ "$VERSION" == "latest" ]]; then
     exit 1
   fi
 fi
+
+prevent_major_version_change "$(installed_version)" "$VERSION"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
